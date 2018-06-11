@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"crypto/rand"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -511,7 +512,13 @@ func main() {
 		log.Fatal(err)
 	}
 
-	sessionStore := sessions.NewCookieStore([]byte("auth-key"))
+	authkey := make([]byte, 64)
+	_, err = rand.Read(authkey)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	sessionStore := sessions.NewCookieStore(authkey)
 	sessionStore.Options = &sessions.Options{
 		Path:     "/",
 		MaxAge:   *maxAge,
