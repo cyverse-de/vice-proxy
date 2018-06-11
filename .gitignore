@@ -1,3 +1,4 @@
 cas-proxy
 *.crt
 *.key
+telepresence.log
