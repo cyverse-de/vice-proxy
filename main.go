@@ -282,8 +282,12 @@ func (c *CASProxy) ResetSessionExpiration(w http.ResponseWriter, r *http.Request
 		return err
 	}
 
-	msg := session.Values[sessionKey].(string)
-	session.Values[sessionKey] = msg
+	msg, ok := session.Values[sessionKey]
+	if !ok {
+		return errors.New("session value not found")
+	}
+
+	session.Values[sessionKey] = msg.(string)
 	session.Save(r, w)
 	return nil
 }
@@ -296,7 +300,11 @@ func (c *CASProxy) Session(r *http.Request, m *mux.RouteMatch) bool {
 		return true
 	}
 
-	msg := session.Values[sessionKey].(string)
+	msgraw, ok := session.Values[sessionKey]
+	if !ok {
+		return true
+	}
+	msg := msgraw.(string)
 	if msg == "" {
 		log.Infof("session value was empty instead of a username")
 		return true
