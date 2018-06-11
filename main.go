@@ -12,12 +12,10 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
-	"time"
 
 	"github.com/Sirupsen/logrus"
-	"github.com/alexedwards/scs/engine/memstore"
-	"github.com/alexedwards/scs/session"
 	"github.com/gorilla/mux"
+	"github.com/gorilla/sessions"
 	"github.com/pkg/errors"
 	"github.com/yhat/wsutil"
 )
@@ -48,16 +46,18 @@ type CASProxy struct {
 	resourceName string // The UUID of the analysis.
 	permsURL     string // The service URL for the permissions service.
 	subjectType  string // The subject type for a user.
+	sessionStore *sessions.CookieStore
 }
 
 // NewCASProxy returns a newly instantiated *CASProxy.
-func NewCASProxy(casBase, casValidate, frontendURL, backendURL, wsbackendURL string) *CASProxy {
+func NewCASProxy(casBase, casValidate, frontendURL, backendURL, wsbackendURL string, cs *sessions.CookieStore) *CASProxy {
 	return &CASProxy{
 		casBase:      casBase,
 		casValidate:  casValidate,
 		frontendURL:  frontendURL,
 		backendURL:   backendURL,
 		wsbackendURL: wsbackendURL,
+		sessionStore: cs,
 	}
 }
 
@@ -253,50 +253,51 @@ func (c *CASProxy) ValidateTicket(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+
 	username := string(fields[1])
-	allowed, err := c.IsAllowed(username)
-	if !allowed || err != nil {
-		if err != nil {
-			err = errors.Wrap(err, "access denied")
-		} else {
-			err = errors.New("access denied")
-		}
-		http.Error(w, err.Error(), http.StatusForbidden)
-		return
-	}
 
 	// Store a session, hopefully to short-circuit the CAS redirect dance in later
 	// requests. The max age of the cookie should be less than the lifetime of
 	// the CAS ticket, which is around 10+ hours. This means that we'll be hitting
 	// the CAS server fairly often. Adjust the max age to rate limit requests to
 	// CAS.
-	err = session.PutInt(r, sessionKey, 1)
+	var s *sessions.Session
+	s, err = c.sessionStore.Get(r, sessionName)
 	if err != nil {
-		err = errors.Wrap(err, "error setting setting value")
+		err = errors.Wrap(err, "error getting session")
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	s.Values[sessionKey] = username
+	s.Save(r, w)
 
 	http.Redirect(w, r, svcURL.String(), http.StatusFound)
+}
+
+// ResetSessionExpiration should reset the session expiration time.
+func (c *CASProxy) ResetSessionExpiration(w http.ResponseWriter, r *http.Request) error {
+	session, err := c.sessionStore.Get(r, sessionName)
+	if err != nil {
+		return err
+	}
+
+	msg := session.Values[sessionKey].(string)
+	session.Values[sessionKey] = msg
+	session.Save(r, w)
+	return nil
 }
 
 // Session implements the mux.Matcher interface so that requests can be routed
 // based on cookie existence.
 func (c *CASProxy) Session(r *http.Request, m *mux.RouteMatch) bool {
-	msg, err := session.GetInt(r, sessionKey)
+	session, err := c.sessionStore.Get(r, sessionName)
 	if err != nil {
 		return true
 	}
 
-	if msg != 1 {
-		log.Infof("session value was %d instead of 1", msg)
-		return true
-	}
-
-	// This should reset the expiration time.
-	err = session.PutInt(r, sessionKey, 1)
-	if err != nil {
-		log.Error(err)
+	msg := session.Values[sessionKey].(string)
+	if msg == "" {
+		log.Infof("session value was empty instead of a username")
 		return true
 	}
 
@@ -389,7 +390,41 @@ func (c *CASProxy) Proxy() (http.Handler, error) {
 	}
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		//Get the username from the cookie
+		session, err := c.sessionStore.Get(r, sessionName)
+		if err != nil {
+			err = errors.Wrap(err, "failed to get session")
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		username := session.Values[sessionKey].(string)
+		if username == "" {
+			err = errors.Wrap(err, "username was empty")
+			http.Error(w, err.Error(), http.StatusForbidden)
+			return
+		}
+
+		// Check to make sure the user can access the resource.
+		allowed, err := c.IsAllowed(username)
+		if !allowed || err != nil {
+			if err != nil {
+				err = errors.Wrap(err, "access denied")
+			} else {
+				err = errors.New("access denied")
+			}
+			http.Error(w, err.Error(), http.StatusForbidden)
+			return
+		}
+
 		log.Printf("%+v\n", r.Header)
+
+		if err = c.ResetSessionExpiration(w, r); err != nil {
+			err = errors.Wrap(err, "error resetting session expiration")
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
 		if c.isWebsocket(r) {
 			ws.ServeHTTP(w, r)
 			return
@@ -493,14 +528,11 @@ func main() {
 		log.Fatal(err)
 	}
 
-	sessionEngine := memstore.New(30 * time.Second)
-
-	var sessionManager func(h http.Handler) http.Handler
-	if *maxAge > 0 {
-		d := time.Duration(*maxAge) * time.Second
-		sessionManager = session.Manage(sessionEngine, session.IdleTimeout(d))
-	} else {
-		sessionManager = session.Manage(sessionEngine)
+	sessionStore := sessions.NewCookieStore([]byte("auth-key"))
+	sessionStore.Options = &sessions.Options{
+		Path:     "/",
+		MaxAge:   *maxAge,
+		HttpOnly: true,
 	}
 
 	r := mux.NewRouter()
@@ -512,7 +544,7 @@ func main() {
 	r.PathPrefix("/").Handler(proxy)
 
 	server := &http.Server{
-		Handler: sessionManager(r),
+		Handler: r,
 		Addr:    *listenAddr,
 	}
 	if useSSL {
