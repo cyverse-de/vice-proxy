@@ -511,6 +511,13 @@ func main() {
 		log.Fatal(err)
 	}
 
+	sessionStore := sessions.NewCookieStore([]byte("auth-key"))
+	sessionStore.Options = &sessions.Options{
+		Path:     "/",
+		MaxAge:   *maxAge,
+		HttpOnly: true,
+	}
+
 	p := &CASProxy{
 		casBase:      *casBase,
 		casValidate:  *casValidate,
@@ -521,18 +528,12 @@ func main() {
 		subjectType:  *subjectType,
 		resourceName: resourceName,
 		permsURL:     *permsURL,
+		sessionStore: sessionStore,
 	}
 
 	proxy, err := p.Proxy()
 	if err != nil {
 		log.Fatal(err)
-	}
-
-	sessionStore := sessions.NewCookieStore([]byte("auth-key"))
-	sessionStore.Options = &sessions.Options{
-		Path:     "/",
-		MaxAge:   *maxAge,
-		HttpOnly: true,
 	}
 
 	r := mux.NewRouter()
