@@ -11,7 +11,6 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"path"
-	"path/filepath"
 	"strings"
 
 	"github.com/Sirupsen/logrus"
@@ -38,16 +37,17 @@ const sessionAccess = "proxy-session-last-access"
 // CASProxy contains the application logic that handles authentication, session
 // validations, ticket validation, and request proxying.
 type CASProxy struct {
-	casBase      string // base URL for the CAS server
-	casValidate  string // The path to the validation endpoint on the CAS server.
-	frontendURL  string // The URL placed into service query param for CAS.
-	backendURL   string // The backend URL to forward to.
-	wsbackendURL string // The websocket URL to forward requests to.
-	resourceType string // The resource type for analysis.
-	resourceName string // The UUID of the analysis.
-	permsURL     string // The service URL for the permissions service.
-	subjectType  string // The subject type for a user.
-	sessionStore *sessions.CookieStore
+	casBase        string // base URL for the CAS server
+	casValidate    string // The path to the validation endpoint on the CAS server.
+	frontendURL    string // The URL placed into service query param for CAS.
+	backendURL     string // The backend URL to forward to.
+	wsbackendURL   string // The websocket URL to forward requests to.
+	resourceType   string // The resource type for analysis.
+	resourceName   string // The UUID of the analysis.
+	ingressURL     string // The URL to the cluster ingress.
+	accessHeader   string // The Host header for checking resource access perms.
+	analysisHeader string // The Host header for getting the analysis ID.
+	sessionStore   *sessions.CookieStore
 }
 
 // NewCASProxy returns a newly instantiated *CASProxy.
@@ -73,28 +73,28 @@ type Analyses struct {
 	Analyses []Analysis `json:"analyses"`
 }
 
-func getResourceName(appsURL, appsUser, externalID string) (string, error) {
-	reqURL, err := url.Parse(appsURL)
+func (c *CASProxy) getResourceName(externalID string) (string, error) {
+	bodymap := map[string]string{}
+	bodymap["external_id"] = externalID
+
+	body, err := json.Marshal(bodymap)
 	if err != nil {
 		return "", err
 	}
-	reqURL.Path = filepath.Join(reqURL.Path, "admin/analyses/by-external-id", externalID)
 
-	v := url.Values{}
-	v.Set("user", appsUser)
-	reqURL.RawQuery = v.Encode()
-
-	resp, err := http.Get(reqURL.String())
-	defer func() {
-		if resp != nil {
-			if resp.Body != nil {
-				resp.Body.Close()
-			}
-		}
-	}()
+	req, err := http.NewRequest(http.MethodPost, c.ingressURL, bytes.NewReader(body))
 	if err != nil {
 		return "", err
 	}
+
+	req.Header.Set(http.CanonicalHeaderKey("Host"), c.analysisHeader)
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
 
 	analyses := &Analyses{}
 	b, err := ioutil.ReadAll(resp.Body)
@@ -145,38 +145,50 @@ type PermissionList struct {
 // IsAllowed will return true if the user is allowed to access the running app
 // and false if they're not. An error might be returned as well. Access should
 // be denied if an error is returned, even if the boolean return value is true.
-func (c *CASProxy) IsAllowed(user string) (bool, error) {
-	requrl, err := url.Parse(c.permsURL)
+func (c *CASProxy) IsAllowed(user, resource string) (bool, error) {
+	bodymap := map[string]string{
+		"subject":  user,
+		"resource": resource,
+	}
+
+	body, err := json.Marshal(bodymap)
 	if err != nil {
 		return false, err
 	}
-	requrl.Path = filepath.Join(requrl.Path, "permissions/subjects", c.subjectType, user, c.resourceType, c.resourceName)
-	resp, err := http.Get(requrl.String())
-	defer func() {
-		if resp != nil {
-			if resp.Body != nil {
-				resp.Body.Close()
-			}
-		}
-	}()
+
+	request, err := http.NewRequest(http.MethodPost, c.ingressURL, bytes.NewReader(body))
 	if err != nil {
 		return false, err
 	}
+
+	request.Header.Set(http.CanonicalHeaderKey("Host"), c.accessHeader)
+
+	client := &http.Client{}
+	resp, err := client.Do(request)
+	if err != nil {
+		return false, err
+	}
+	defer resp.Body.Close()
+
 	b, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
 		return false, err
 	}
+
 	l := &PermissionList{
 		Permissions: []Permission{},
 	}
+
 	if err = json.Unmarshal(b, l); err != nil {
 		return false, err
 	}
+
 	if len(l.Permissions) > 0 {
 		if l.Permissions[0].Level != "" {
 			return true, nil
 		}
 	}
+
 	return false, nil
 }
 
@@ -415,7 +427,7 @@ func (c *CASProxy) Proxy() (http.Handler, error) {
 		}
 
 		// Check to make sure the user can access the resource.
-		allowed, err := c.IsAllowed(username)
+		allowed, err := c.IsAllowed(username, c.resourceName)
 		if !allowed || err != nil {
 			if err != nil {
 				err = errors.Wrap(err, "access denied")
@@ -444,21 +456,19 @@ func (c *CASProxy) Proxy() (http.Handler, error) {
 
 func main() {
 	var (
-		backendURL   = flag.String("backend-url", "http://localhost:60000", "The hostname and port to proxy requests to.")
-		wsbackendURL = flag.String("ws-backend-url", "", "The backend URL for the handling websocket requests. Defaults to the value of --backend-url with a scheme of ws://")
-		frontendURL  = flag.String("frontend-url", "", "The URL for the frontend server. Might be different from the hostname and listen port.")
-		listenAddr   = flag.String("listen-addr", "0.0.0.0:8080", "The listen port number.")
-		casBase      = flag.String("cas-base-url", "", "The base URL to the CAS host.")
-		casValidate  = flag.String("cas-validate", "validate", "The CAS URL endpoint for validating tickets.")
-		maxAge       = flag.Int("max-age", 0, "The idle timeout for session, in seconds.")
-		sslCert      = flag.String("ssl-cert", "", "Path to the SSL .crt file.")
-		sslKey       = flag.String("ssl-key", "", "Path to the SSL .key file.")
-		resourceType = flag.String("resource-type", "analysis", "The resource type that gets passed to the permissions service.")
-		permsURL     = flag.String("permissions-url", "", "The URL for the permissions service.")
-		subjectType  = flag.String("subject-type", "user", "The subject type to pass to the permissions service.")
-		appsUser     = flag.String("apps-user", "", "Username to use when calling the apps api.")
-		appsURL      = flag.String("apps-url", "", "The URL for the apps service.")
-		externalID   = flag.String("external-id", "", "The external ID to pass to the apps service when looking up the analysis ID.")
+		backendURL     = flag.String("backend-url", "http://localhost:60000", "The hostname and port to proxy requests to.")
+		wsbackendURL   = flag.String("ws-backend-url", "", "The backend URL for the handling websocket requests. Defaults to the value of --backend-url with a scheme of ws://")
+		frontendURL    = flag.String("frontend-url", "", "The URL for the frontend server. Might be different from the hostname and listen port.")
+		listenAddr     = flag.String("listen-addr", "0.0.0.0:8080", "The listen port number.")
+		casBase        = flag.String("cas-base-url", "", "The base URL to the CAS host.")
+		casValidate    = flag.String("cas-validate", "validate", "The CAS URL endpoint for validating tickets.")
+		maxAge         = flag.Int("max-age", 0, "The idle timeout for session, in seconds.")
+		sslCert        = flag.String("ssl-cert", "", "Path to the SSL .crt file.")
+		sslKey         = flag.String("ssl-key", "", "Path to the SSL .key file.")
+		ingressURL     = flag.String("ingress-url", "", "The URL to the cluster ingress.")
+		analysisHeader = flag.String("analysis-header", "get-analysis-id", "The Host header for the ingress service that gets the analysis ID.")
+		accessHeader   = flag.String("access-header", "check-resource-access", "The Host header for the ingress service that checks analysis access.")
+		externalID     = flag.String("external-id", "", "The external ID to pass to the apps service when looking up the analysis ID.")
 	)
 
 	flag.Parse()
@@ -492,16 +502,8 @@ func main() {
 		*wsbackendURL = w.String()
 	}
 
-	if *appsUser == "" {
-		log.Fatal("--apps-user must be set.")
-	}
-
-	if *appsURL == "" {
-		log.Fatal("--apps-url must be set.")
-	}
-
-	if *permsURL == "" {
-		log.Fatal("--permissions-url must be set.")
+	if *ingressURL == "" {
+		log.Fatal("--ingress-url must be set.")
 	}
 
 	if *externalID == "" {
@@ -515,13 +517,8 @@ func main() {
 	log.Infof("CAS base URL is %s", *casBase)
 	log.Infof("CAS ticket validator endpoint is %s", *casValidate)
 
-	resourceName, err := getResourceName(*appsURL, *appsUser, *externalID)
-	if err != nil {
-		log.Fatal(err)
-	}
-
 	authkey := make([]byte, 64)
-	_, err = rand.Read(authkey)
+	_, err := rand.Read(authkey)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -534,17 +531,22 @@ func main() {
 	}
 
 	p := &CASProxy{
-		casBase:      *casBase,
-		casValidate:  *casValidate,
-		frontendURL:  *frontendURL,
-		backendURL:   *backendURL,
-		wsbackendURL: *wsbackendURL,
-		resourceType: *resourceType,
-		subjectType:  *subjectType,
-		resourceName: resourceName,
-		permsURL:     *permsURL,
-		sessionStore: sessionStore,
+		casBase:        *casBase,
+		casValidate:    *casValidate,
+		frontendURL:    *frontendURL,
+		backendURL:     *backendURL,
+		wsbackendURL:   *wsbackendURL,
+		ingressURL:     *ingressURL,
+		accessHeader:   *accessHeader,
+		analysisHeader: *analysisHeader,
+		sessionStore:   sessionStore,
 	}
+
+	resourceName, err := p.getResourceName(*externalID)
+	if err != nil {
+		log.Fatal(err)
+	}
+	p.resourceName = resourceName
 
 	proxy, err := p.Proxy()
 	if err != nil {
