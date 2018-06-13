@@ -87,7 +87,7 @@ func (c *CASProxy) getResourceName(externalID string) (string, error) {
 		return "", err
 	}
 
-	req.Header.Set(http.CanonicalHeaderKey("Host"), c.analysisHeader)
+	req.Host = c.analysisHeader
 
 	client := &http.Client{}
 	resp, err := client.Do(req)
@@ -96,18 +96,21 @@ func (c *CASProxy) getResourceName(externalID string) (string, error) {
 	}
 	defer resp.Body.Close()
 
-	analyses := &Analyses{}
+	analysis := &Analysis{}
 	b, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
 		return "", err
 	}
-	if err = json.Unmarshal(b, analyses); err != nil {
+
+	if err = json.Unmarshal(b, analysis); err != nil {
 		return "", err
 	}
-	if len(analyses.Analyses) < 1 {
+
+	if analysis.ID == "" {
 		return "", errors.New("no analyses found")
 	}
-	return analyses.Analyses[0].ID, nil
+
+	return analysis.ID, nil
 }
 
 // Resource is an item that can have permissions attached to it in the
@@ -161,7 +164,7 @@ func (c *CASProxy) IsAllowed(user, resource string) (bool, error) {
 		return false, err
 	}
 
-	request.Header.Set(http.CanonicalHeaderKey("Host"), c.accessHeader)
+	request.Host = c.accessHeader
 
 	client := &http.Client{}
 	resp, err := client.Do(request)
