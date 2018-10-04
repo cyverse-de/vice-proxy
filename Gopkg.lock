@@ -35,6 +35,12 @@
   revision = "c605e284fe17294bda444b34710735b29d1a9d90"
 
 [[projects]]
+  name = "github.com/rs/cors"
+  packages = ["."]
+  revision = "3fb1b69b103a84de38a19c3c6ec073dd6caa4d3f"
+  version = "v1.5.0"
+
+[[projects]]
   name = "github.com/yhat/wsutil"
   packages = ["."]
   revision = "666b94ea38f279dc3ac060200f708ec2d39abdce"
@@ -47,6 +53,6 @@
 [solve-meta]
   analyzer-name = "dep"
   analyzer-version = 1
-  inputs-digest = "156635c88b55ac825510c1d0b1cb4a23560e48f0341da98873a5c3db9d069113"
+  inputs-digest = "c1e3d541f8f4171bed3c524ca7f9646e5ca8c33c070f93efcbb32698dd8d89e1"
   solver-name = "gps-cdcl"
   solver-version = 1

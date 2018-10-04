@@ -17,6 +17,7 @@ import (
 	"github.com/gorilla/mux"
 	"github.com/gorilla/sessions"
 	"github.com/pkg/errors"
+	"github.com/rs/cors"
 	"github.com/yhat/wsutil"
 )
 
@@ -457,8 +458,21 @@ func (c *CASProxy) Proxy() (http.Handler, error) {
 	}), nil
 }
 
+type originFlags []string
+
+func (o *originFlags) String() string {
+	return strings.Join([]string(*o), ",")
+}
+
+func (o *originFlags) Set(s string) error {
+	parts := strings.Split(s, ",")
+	*o = append(*o, parts...)
+	return nil
+}
+
 func main() {
 	var (
+		corsOrigins    originFlags
 		backendURL     = flag.String("backend-url", "http://localhost:60000", "The hostname and port to proxy requests to.")
 		wsbackendURL   = flag.String("ws-backend-url", "", "The backend URL for the handling websocket requests. Defaults to the value of --backend-url with a scheme of ws://")
 		frontendURL    = flag.String("frontend-url", "", "The URL for the frontend server. Might be different from the hostname and listen port.")
@@ -474,6 +488,7 @@ func main() {
 		externalID     = flag.String("external-id", "", "The external ID to pass to the apps service when looking up the analysis ID.")
 	)
 
+	flag.Var(&corsOrigins, "allowed-origins", "List of allowed origins, separated by commas.")
 	flag.Parse()
 
 	if *casBase == "" {
@@ -494,6 +509,10 @@ func main() {
 			log.Fatal("--ssl-key is required with --ssl-cert.")
 		}
 		useSSL = true
+	}
+
+	if len(corsOrigins) < 1 {
+		corsOrigins = originFlags{"*.cyverse.run", "*.cyverse.org", "*.cyverse.run:4343", "cyverse.run", "cyverse.run:4343"}
 	}
 
 	if *wsbackendURL == "" {
@@ -519,6 +538,10 @@ func main() {
 	log.Infof("listen address is %s", *listenAddr)
 	log.Infof("CAS base URL is %s", *casBase)
 	log.Infof("CAS ticket validator endpoint is %s", *casValidate)
+
+	for c := range corsOrigins {
+		log.Infof("Origin: %s\n", c)
+	}
 
 	authkey := make([]byte, 64)
 	_, err := rand.Read(authkey)
@@ -564,8 +587,13 @@ func main() {
 	r.PathPrefix("/").MatcherFunc(p.Session).Handler(http.HandlerFunc(p.RedirectToCAS))
 	r.PathPrefix("/").Handler(proxy)
 
+	c := cors.New(cors.Options{
+		AllowedOrigins:   corsOrigins,
+		AllowCredentials: true,
+	})
+
 	server := &http.Server{
-		Handler: r,
+		Handler: c.Handler(r),
 		Addr:    *listenAddr,
 	}
 	if useSSL {
