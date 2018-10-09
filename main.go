@@ -361,7 +361,7 @@ func (c *CASProxy) RedirectToCAS(w http.ResponseWriter, r *http.Request) {
 	casURL.Path = path.Join(casURL.Path, "login")
 
 	// perform the redirect
-	http.Redirect(w, r, casURL.String(), http.StatusPermanentRedirect)
+	http.Redirect(w, r, casURL.String(), http.StatusTemporaryRedirect)
 }
 
 // ReverseProxy returns a proxy that forwards requests to the configured
