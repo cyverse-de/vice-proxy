@@ -402,6 +402,31 @@ func (c *CASProxy) isWebsocket(r *http.Request) bool {
 	return upgrade
 }
 
+// URLIsReady will write out a JSON-encoded response in the format
+// {"ready":boolean}, telling whether or not the underlying application is ready
+// for business yet.
+func (c *CASProxy) URLIsReady(w http.ResponseWriter, r *http.Request) {
+	var ready bool
+	resp, err := http.Get(c.backendURL)
+	if err != nil {
+		log.Error(err)
+	} else {
+		if resp.StatusCode >= 200 && resp.StatusCode <= 399 {
+			ready = true
+		}
+	}
+
+	data := map[string]bool{
+		"ready": ready,
+	}
+	body, err := json.Marshal(data)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	fmt.Fprintln(w, string(body))
+}
+
 // Proxy returns a handler that can support both websockets and http requests.
 func (c *CASProxy) Proxy() (http.Handler, error) {
 	ws, err := c.WSReverseProxy()
@@ -539,7 +564,7 @@ func main() {
 	log.Infof("CAS base URL is %s", *casBase)
 	log.Infof("CAS ticket validator endpoint is %s", *casValidate)
 
-	for c := range corsOrigins {
+	for _, c := range corsOrigins {
 		log.Infof("Origin: %s\n", c)
 	}
 
@@ -583,6 +608,7 @@ func main() {
 
 	// If the query contains a ticket in the query params, then it needs to be
 	// validated.
+	r.PathPrefix("/url-ready").HandlerFunc(p.URLIsReady)
 	r.PathPrefix("/").Queries("ticket", "").Handler(http.HandlerFunc(p.ValidateTicket))
 	r.PathPrefix("/").MatcherFunc(p.Session).Handler(http.HandlerFunc(p.RedirectToCAS))
 	r.PathPrefix("/").Handler(proxy)
