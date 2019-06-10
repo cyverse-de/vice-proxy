@@ -1,0 +1,17 @@
+github.com/Sirupsen/logrus v0.0.0-20170608221441-85b1699d5056 h1:RNaGh2XZmfkceN+EZYxQTkYlbWDzdXbpvCsMNGXRoNk=
+github.com/Sirupsen/logrus v0.0.0-20170608221441-85b1699d5056/go.mod h1:rmk17hk6i8ZSAJkSDa7nOxamrG+SP4P0mm+DAvExv4U=
+github.com/gorilla/context v1.1.1 h1:AWwleXJkX/nhcU9bZSnZoi3h/qGYqQAGhq6zZe/aQW8=
+github.com/gorilla/context v1.1.1/go.mod h1:kBGZzfjB9CEq2AlWe17Uuf7NDRt0dE0s8S51q0aT7Yg=
+github.com/gorilla/mux v0.0.0-20170602193140-18fca3155018 h1:bWIW2RoFDaYnu2wRs8HwFnV+F3CwqbOoiBN62qBo5C8=
+github.com/gorilla/mux v0.0.0-20170602193140-18fca3155018/go.mod h1:1lud6UwP+6orDFRuTfBEV8e9/aOM/c4fVVCaMa2zaAs=
+github.com/gorilla/securecookie v1.1.1 h1:miw7JPhV+b/lAHSXz4qd/nN9jRiAFV5FwjeKyCS8BvQ=
+github.com/gorilla/securecookie v1.1.1/go.mod h1:ra0sb63/xPlUeL+yeDciTfxMRAA+MP+HVt/4epWDjd4=
+github.com/gorilla/sessions v1.1.1 h1:YMDmfaK68mUixINzY/XjscuJ47uXFWSSHzFbBQM0PrE=
+github.com/gorilla/sessions v1.1.1/go.mod h1:8KCfur6+4Mqcc6S0FEfKuN15Vl5MgXW92AE8ovaJD0w=
+github.com/pkg/errors v0.0.0-20170505043639-c605e284fe17 h1:chPfVn+gpAM5CTpTyVU9j8J+xgRGwmoDlNDLjKnJiYo=
+github.com/pkg/errors v0.0.0-20170505043639-c605e284fe17/go.mod h1:bwawxfHBFNV+L2hUp1rHADufV3IMtnDRdf1r5NINEl0=
+github.com/rs/cors v1.5.0 h1:dgSHE6+ia18arGOTIYQKKGWLvEbGvmbNE6NfxhoNHUY=
+github.com/rs/cors v1.5.0/go.mod h1:gFx+x8UowdsKA9AchylcLynDq+nNFfI8FkUZdN/jGCU=
+github.com/yhat/wsutil v0.0.0-20150619204602-666b94ea38f2 h1:z5K95NXmLEvHOlgb61GWfDD+RmoXG2JfvqWxa4O65m0=
+github.com/yhat/wsutil v0.0.0-20150619204602-666b94ea38f2/go.mod h1:DIGbh/f5XMAessMV/uaIik81gkDVjUeQ9ApdaU7wRKE=
+golang.org/x/sys v0.0.0-20170608164803-0b25a408a500/go.mod h1:STP8DvDyc/dI5b8T5hshtkjS+E42TnysNCUPdjciGhY=

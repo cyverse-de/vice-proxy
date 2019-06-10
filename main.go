@@ -38,17 +38,19 @@ const sessionAccess = "proxy-session-last-access"
 // CASProxy contains the application logic that handles authentication, session
 // validations, ticket validation, and request proxying.
 type CASProxy struct {
-	casBase        string // base URL for the CAS server
-	casValidate    string // The path to the validation endpoint on the CAS server.
-	frontendURL    string // The URL placed into service query param for CAS.
-	backendURL     string // The backend URL to forward to.
-	wsbackendURL   string // The websocket URL to forward requests to.
-	resourceType   string // The resource type for analysis.
-	resourceName   string // The UUID of the analysis.
-	ingressURL     string // The URL to the cluster ingress.
-	accessHeader   string // The Host header for checking resource access perms.
-	analysisHeader string // The Host header for getting the analysis ID.
-	sessionStore   *sessions.CookieStore
+	casBase           string // base URL for the CAS server
+	casValidate       string // The path to the validation endpoint on the CAS server.
+	frontendURL       string // The URL placed into service query param for CAS.
+	backendURL        string // The backend URL to forward to.
+	wsbackendURL      string // The websocket URL to forward requests to.
+	resourceType      string // The resource type for analysis.
+	resourceName      string // The UUID of the analysis.
+	ingressURL        string // The URL to the cluster ingress.
+	accessHeader      string // The Host header for checking resource access perms.
+	analysisHeader    string // The Host header for getting the analysis ID.
+	sessionStore      *sessions.CookieStore
+	loadingURL        string // The URL to the loading page for VICE apps.
+	doLoadingRedirect bool   // Whether or not to redirect to the loading page when the app isn't ready.
 }
 
 // NewCASProxy returns a newly instantiated *CASProxy.
@@ -402,18 +404,25 @@ func (c *CASProxy) isWebsocket(r *http.Request) bool {
 	return upgrade
 }
 
+func (c *CASProxy) backendIsReady(backendURL string) (bool, error) {
+	resp, err := http.Get(backendURL)
+	if err != nil {
+		return false, err
+	}
+	if resp.StatusCode >= 200 && resp.StatusCode <= 399 {
+		return true, nil
+	}
+	return false, nil
+
+}
+
 // URLIsReady will write out a JSON-encoded response in the format
 // {"ready":boolean}, telling whether or not the underlying application is ready
 // for business yet.
 func (c *CASProxy) URLIsReady(w http.ResponseWriter, r *http.Request) {
-	var ready bool
-	resp, err := http.Get(c.backendURL)
+	ready, err := c.backendIsReady(c.backendURL)
 	if err != nil {
 		log.Error(err)
-	} else {
-		if resp.StatusCode >= 200 && resp.StatusCode <= 399 {
-			ready = true
-		}
 	}
 
 	data := map[string]bool{
@@ -440,6 +449,31 @@ func (c *CASProxy) Proxy() (http.Handler, error) {
 	}
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var ready bool
+		// redirect to the loading page if the backend app isn't ready yet,
+		// but only if the loading redirect is enabled.
+		if c.doLoadingRedirect {
+			ready, err = c.backendIsReady(c.backendURL)
+			if err != nil {
+				err = errors.Wrap(err, "failed to check backend")
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				log.Error(err)
+				return
+			}
+			if !ready {
+				loadingURL, err := url.Parse(c.loadingURL)
+				if err != nil {
+					http.Error(w, err.Error(), http.StatusInternalServerError)
+					return
+				}
+				q := loadingURL.Query()
+				q.Set("url", c.frontendURL)
+				loadingURL.RawQuery = q.Encode()
+				http.Redirect(w, r, loadingURL.String(), http.StatusTemporaryRedirect)
+				return
+			}
+		}
+
 		//Get the username from the cookie
 		session, err := c.sessionStore.Get(r, sessionName)
 		if err != nil {
@@ -497,20 +531,22 @@ func (o *originFlags) Set(s string) error {
 
 func main() {
 	var (
-		corsOrigins    originFlags
-		backendURL     = flag.String("backend-url", "http://localhost:60000", "The hostname and port to proxy requests to.")
-		wsbackendURL   = flag.String("ws-backend-url", "", "The backend URL for the handling websocket requests. Defaults to the value of --backend-url with a scheme of ws://")
-		frontendURL    = flag.String("frontend-url", "", "The URL for the frontend server. Might be different from the hostname and listen port.")
-		listenAddr     = flag.String("listen-addr", "0.0.0.0:8080", "The listen port number.")
-		casBase        = flag.String("cas-base-url", "", "The base URL to the CAS host.")
-		casValidate    = flag.String("cas-validate", "validate", "The CAS URL endpoint for validating tickets.")
-		maxAge         = flag.Int("max-age", 0, "The idle timeout for session, in seconds.")
-		sslCert        = flag.String("ssl-cert", "", "Path to the SSL .crt file.")
-		sslKey         = flag.String("ssl-key", "", "Path to the SSL .key file.")
-		ingressURL     = flag.String("ingress-url", "", "The URL to the cluster ingress.")
-		analysisHeader = flag.String("analysis-header", "get-analysis-id", "The Host header for the ingress service that gets the analysis ID.")
-		accessHeader   = flag.String("access-header", "check-resource-access", "The Host header for the ingress service that checks analysis access.")
-		externalID     = flag.String("external-id", "", "The external ID to pass to the apps service when looking up the analysis ID.")
+		corsOrigins       originFlags
+		backendURL        = flag.String("backend-url", "http://localhost:60000", "The hostname and port to proxy requests to.")
+		wsbackendURL      = flag.String("ws-backend-url", "", "The backend URL for the handling websocket requests. Defaults to the value of --backend-url with a scheme of ws://")
+		frontendURL       = flag.String("frontend-url", "", "The URL for the frontend server. Might be different from the hostname and listen port.")
+		listenAddr        = flag.String("listen-addr", "0.0.0.0:8080", "The listen port number.")
+		casBase           = flag.String("cas-base-url", "", "The base URL to the CAS host.")
+		casValidate       = flag.String("cas-validate", "validate", "The CAS URL endpoint for validating tickets.")
+		maxAge            = flag.Int("max-age", 0, "The idle timeout for session, in seconds.")
+		sslCert           = flag.String("ssl-cert", "", "Path to the SSL .crt file.")
+		sslKey            = flag.String("ssl-key", "", "Path to the SSL .key file.")
+		ingressURL        = flag.String("ingress-url", "", "The URL to the cluster ingress.")
+		analysisHeader    = flag.String("analysis-header", "get-analysis-id", "The Host header for the ingress service that gets the analysis ID.")
+		accessHeader      = flag.String("access-header", "check-resource-access", "The Host header for the ingress service that checks analysis access.")
+		externalID        = flag.String("external-id", "", "The external ID to pass to the apps service when looking up the analysis ID.")
+		loadingURL        = flag.String("loading-url", "https://loading.cyverse.run", "The URL to the loading page for VICE apps.")
+		doLoadingRedirect = flag.Bool("do-loading-redirect", false, "Redirect to the loading page when the backend service isn't ready yet.")
 	)
 
 	flag.Var(&corsOrigins, "allowed-origins", "List of allowed origins, separated by commas.")
@@ -582,15 +618,17 @@ func main() {
 	}
 
 	p := &CASProxy{
-		casBase:        *casBase,
-		casValidate:    *casValidate,
-		frontendURL:    *frontendURL,
-		backendURL:     *backendURL,
-		wsbackendURL:   *wsbackendURL,
-		ingressURL:     *ingressURL,
-		accessHeader:   *accessHeader,
-		analysisHeader: *analysisHeader,
-		sessionStore:   sessionStore,
+		casBase:           *casBase,
+		casValidate:       *casValidate,
+		frontendURL:       *frontendURL,
+		backendURL:        *backendURL,
+		wsbackendURL:      *wsbackendURL,
+		ingressURL:        *ingressURL,
+		accessHeader:      *accessHeader,
+		analysisHeader:    *analysisHeader,
+		sessionStore:      sessionStore,
+		loadingURL:        *loadingURL,
+		doLoadingRedirect: *doLoadingRedirect,
 	}
 
 	resourceName, err := p.getResourceName(*externalID)
