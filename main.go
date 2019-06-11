@@ -436,7 +436,7 @@ func (c *CASProxy) URLIsReady(w http.ResponseWriter, r *http.Request) {
 	if ready {
 		fmt.Fprintf(w, string(body))
 	} else {
-		http.Error(w, string(body), http.StatusInternalServerError)
+		http.Error(w, string(body), http.StatusNotAcceptable)
 	}
 }
 
