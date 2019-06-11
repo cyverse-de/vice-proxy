@@ -426,12 +426,18 @@ func (c *CASProxy) URLIsReady(w http.ResponseWriter, r *http.Request) {
 	data := map[string]bool{
 		"ready": ready,
 	}
+
 	body, err := json.Marshal(data)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	fmt.Fprintln(w, string(body))
+
+	if ready {
+		fmt.Fprintf(w, string(body))
+	} else {
+		http.Error(w, string(body), http.StatusInternalServerError)
+	}
 }
 
 // Proxy returns a handler that can support both websockets and http requests.
