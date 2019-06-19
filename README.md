@@ -1,4 +1,4 @@
-cas-proxy
-=========
+vice-proxy
+==========
 
-A simple http(s)/websocket proxy that handles CAS authentication.
+Sidecar application for VICE applications running inside the Kubernetes for the CyVerse Discovery Environment.

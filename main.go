@@ -22,8 +22,8 @@ import (
 )
 
 var log = logrus.WithFields(logrus.Fields{
-	"service": "cas-proxy",
-	"art-id":  "cas-proxy",
+	"service": "vice-proxy",
+	"art-id":  "vice-proxy",
 	"group":   "org.cyverse",
 })
 

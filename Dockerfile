@@ -1,9 +1,9 @@
 FROM golang:1.8
 
-COPY . /go/src/github.com/cyverse-de/cas-proxy
-RUN go install github.com/cyverse-de/cas-proxy
+COPY . /go/src/github.com/cyverse-de/vice-proxy
+RUN go install github.com/cyverse-de/vice-proxy
 
-ENTRYPOINT ["cas-proxy"]
+ENTRYPOINT ["vice-proxy"]
 CMD ["--help"]
 
 ARG git_commit=unknown
@@ -14,5 +14,5 @@ LABEL org.cyverse.git-ref="$git_commit"
 LABEL org.cyverse.version="$version"
 LABEL org.cyverse.descriptive-version="$descriptive_version"
 LABEL org.label-schema.vcs-ref="$git_commit"
-LABEL org.label-schema.vcs-url="https://github.com/cyverse-de/cas-proxy"
+LABEL org.label-schema.vcs-url="https://github.com/cyverse-de/vice-proxy"
 LABEL org.label-schema.version="$descriptive_version"

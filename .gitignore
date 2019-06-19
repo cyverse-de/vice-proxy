@@ -1,4 +1,4 @@
-cas-proxy
+vice-proxy
 *.crt
 *.key
 telepresence.log
