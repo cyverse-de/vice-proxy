@@ -45,10 +45,9 @@ type CASProxy struct {
 	wsbackendURL   string // The websocket URL to forward requests to.
 	resourceType   string // The resource type for analysis.
 	resourceName   string // The UUID of the analysis.
-	ingressURL     string // The URL to the cluster ingress.
-	accessHeader   string // The Host header for checking resource access perms.
-	analysisHeader string // The Host header for getting the analysis ID.
-	sessionStore   *sessions.CookieStore
+	getAnalysisIDBase string // The base URL for the get-analysis-id service.
+	checkResourceAccessBase string // The base URL for the check-resource-access service.
+	sessionStore   *sessions.CookieStore // The backend session storage
 }
 
 // NewCASProxy returns a newly instantiated *CASProxy.
@@ -83,12 +82,10 @@ func (c *CASProxy) getResourceName(externalID string) (string, error) {
 		return "", err
 	}
 
-	req, err := http.NewRequest(http.MethodPost, c.ingressURL, bytes.NewReader(body))
+	req, err := http.NewRequest(http.MethodPost, c.getAnalysisIDBase, bytes.NewReader(body))
 	if err != nil {
 		return "", err
 	}
-
-	req.Host = c.analysisHeader
 
 	client := &http.Client{}
 	resp, err := client.Do(req)
@@ -160,12 +157,10 @@ func (c *CASProxy) IsAllowed(user, resource string) (bool, error) {
 		return false, err
 	}
 
-	request, err := http.NewRequest(http.MethodPost, c.ingressURL, bytes.NewReader(body))
+	request, err := http.NewRequest(http.MethodPost, c.checkResourceAccessBase, bytes.NewReader(body))
 	if err != nil {
 		return false, err
 	}
-
-	request.Host = c.accessHeader
 
 	client := &http.Client{}
 	resp, err := client.Do(request)
@@ -520,9 +515,8 @@ func main() {
 		maxAge         = flag.Int("max-age", 0, "The idle timeout for session, in seconds.")
 		sslCert        = flag.String("ssl-cert", "", "Path to the SSL .crt file.")
 		sslKey         = flag.String("ssl-key", "", "Path to the SSL .key file.")
-		ingressURL     = flag.String("ingress-url", "", "The URL to the cluster ingress.")
-		analysisHeader = flag.String("analysis-header", "get-analysis-id", "The Host header for the ingress service that gets the analysis ID.")
-		accessHeader   = flag.String("access-header", "check-resource-access", "The Host header for the ingress service that checks analysis access.")
+		getAnalysisIDBase = flag.String("get-analysis-id-base", "http://get-analysis-id", "The base URL for the get-analysis-id service.")
+		checkResourceAccessBase = flag.String("check-resource-access", "http://check-resource-access", "The base URL for the check-resource-access service.")
 		externalID     = flag.String("external-id", "", "The external ID to pass to the apps service when looking up the analysis ID.")
 	)
 
@@ -562,10 +556,6 @@ func main() {
 		*wsbackendURL = w.String()
 	}
 
-	if *ingressURL == "" {
-		log.Fatal("--ingress-url must be set.")
-	}
-
 	if *externalID == "" {
 		log.Fatal("--external-id must be set.")
 	}
@@ -600,9 +590,8 @@ func main() {
 		frontendURL:    *frontendURL,
 		backendURL:     *backendURL,
 		wsbackendURL:   *wsbackendURL,
-		ingressURL:     *ingressURL,
-		accessHeader:   *accessHeader,
-		analysisHeader: *analysisHeader,
+		getAnalysisIDBase: *getAnalysisIDBase,
+		checkResourceAccessBase: *checkResourceAccessBase,
 		sessionStore:   sessionStore,
 	}
 
