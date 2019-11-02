@@ -435,6 +435,16 @@ func (c *CASProxy) URLIsReady(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// GetFrontendHost returns the host and port portions of the resource name.
+func (c *CASProxy) GetFrontendHost() (string, error) {
+	svcURL, err := url.Parse(c.frontendURL)
+	if err != nil {
+		return "", errors.Wrapf(err, "failed to parse the frontend URL %s", c.frontendURL)
+	}
+
+	return svcURL.Host, nil
+}
+
 // Proxy returns a handler that can support both websockets and http requests.
 func (c *CASProxy) Proxy() (http.Handler, error) {
 	ws, err := c.WSReverseProxy()
@@ -443,6 +453,11 @@ func (c *CASProxy) Proxy() (http.Handler, error) {
 	}
 
 	rp, err := c.ReverseProxy()
+	if err != nil {
+		return nil, err
+	}
+
+	frontendHost, err := c.GetFrontendHost()
 	if err != nil {
 		return nil, err
 	}
@@ -475,6 +490,10 @@ func (c *CASProxy) Proxy() (http.Handler, error) {
 			return
 		}
 
+		// Override the X-Forwarded-Host header.
+		r.Header.Set("X-Forwarded-Host", frontendHost)
+
+		// Log the headers.
 		log.Printf("%+v\n", r.Header)
 
 		if err = c.ResetSessionExpiration(w, r); err != nil {
