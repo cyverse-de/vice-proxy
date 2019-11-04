@@ -1,4 +1,5 @@
 #!groovy
+milestone 0
 node('docker') {
     slackJobDescription = "job '${env.JOB_NAME} [${env.BUILD_NUMBER}]' (${env.BUILD_URL})"
     try {
@@ -14,8 +15,11 @@ node('docker') {
         echo descriptive_version
 
         dockerRepo = "test-${env.BUILD_TAG}"
+        dockerPushRepo = "${service.dockerUser}/${service.repo}:${env.BRANCH_NAME}"
 
-        sh "docker build --rm --build-arg git_commit=${git_commit} --build-arg descriptive_version=${descriptive_version} -t ${dockerRepo} ."
+        milestone 50
+        sh "docker build --pull --cache-from=${dockerPushRepo} --rm --build-arg git_commit=${git_commit} --build-arg descriptive_version=${descriptive_version} -t ${dockerRepo} ."
+        milestone 51
 
         image_sha = sh(returnStdout: true, script: "docker inspect -f '{{ .Config.Image }}' ${dockerRepo}").trim()
         echo image_sha
@@ -24,14 +28,22 @@ node('docker') {
         fingerprint "${dockerRepo}.docker-image-sha"
 
         dockerTestRunner = "test-${env.BUILD_TAG}"
+        dockerTestCleanup = "test-cleanup-${env.BUILD_TAG}"
         dockerPusher = "push-${env.BUILD_TAG}"
         try {
             stage "Test"
-            sh "docker run --rm --name ${dockerTestRunner} --entrypoint 'go' ${dockerRepo} test github.com/cyverse-de/${service.repo}"
+            try {
+              sh "docker create --name ${dockerTestRunner} ${dockerRepo}"
+              sh "docker cp ${dockerTestRunner}:/test-results.xml ."
+              sh "docker rm ${dockerTestRunner}"
+            } finally {
+                junit 'test-results.xml'
+
+                sh "docker run --rm --name ${dockerTestCleanup} -v \$(pwd):/build -w /build alpine rm -r test-results.xml"
+            }
 
             milestone 100
             stage "Docker Push"
-            dockerPushRepo = "${service.dockerUser}/${service.repo}:${env.BRANCH_NAME}"
             lock("docker-push-${dockerPushRepo}") {
               milestone 101
               sh "docker tag ${dockerRepo} ${dockerPushRepo}"
@@ -50,6 +62,9 @@ node('docker') {
         } finally {
             sh returnStatus: true, script: "docker kill ${dockerTestRunner}"
             sh returnStatus: true, script: "docker rm ${dockerTestRunner}"
+
+            sh returnStatus: true, script: "docker kill ${dockerTestCleanup}"
+            sh returnStatus: true, script: "docker rm ${dockerTestCleanup}"
 
             sh returnStatus: true, script: "docker kill ${dockerPusher}"
             sh returnStatus: true, script: "docker rm ${dockerPusher}"
