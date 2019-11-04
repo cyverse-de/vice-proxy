@@ -331,7 +331,6 @@ func (c *CASProxy) Session(r *http.Request, m *mux.RouteMatch) bool {
 // RedirectToCAS redirects the request to CAS, setting the service query
 // parameter to the value in frontendURL.
 func (c *CASProxy) RedirectToCAS(w http.ResponseWriter, r *http.Request) {
-	fmt.Println("redirect to cas")
 	casURL, err := url.Parse(c.casBase)
 	if err != nil {
 		err = errors.Wrapf(err, "failed to parse CAS base URL %s", c.casBase)
@@ -360,6 +359,7 @@ func (c *CASProxy) RedirectToCAS(w http.ResponseWriter, r *http.Request) {
 	casURL.Path = path.Join(casURL.Path, "login")
 
 	// perform the redirect
+	log.Warnf("redirecting to CAS server at %s with status code %d", casURL.String(), http.StatusTemporaryRedirect)
 	http.Redirect(w, r, casURL.String(), http.StatusTemporaryRedirect)
 }
 
@@ -467,6 +467,8 @@ func (c *CASProxy) Proxy() (http.Handler, error) {
 	}
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		log.Warn("handling request for %s from remote address %s", r.URL.String(), r.RemoteAddr)
+
 		//Get the username from the cookie
 		session, err := c.sessionStore.Get(r, sessionName)
 		if err != nil {
@@ -496,9 +498,6 @@ func (c *CASProxy) Proxy() (http.Handler, error) {
 
 		// Override the X-Forwarded-Host header.
 		r.Header.Set("X-Forwarded-Host", frontendHost)
-
-		// Log the headers.
-		log.Printf("%+v\n", r.Header)
 
 		if err = c.ResetSessionExpiration(w, r); err != nil {
 			err = errors.Wrap(err, "error resetting session expiration")
