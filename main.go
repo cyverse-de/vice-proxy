@@ -13,11 +13,11 @@ import (
 	"path"
 	"strings"
 
-	"github.com/Sirupsen/logrus"
 	"github.com/gorilla/mux"
 	"github.com/gorilla/sessions"
 	"github.com/pkg/errors"
 	"github.com/rs/cors"
+	"github.com/sirupsen/logrus"
 	"github.com/yhat/wsutil"
 )
 
@@ -26,10 +26,6 @@ var log = logrus.WithFields(logrus.Fields{
 	"art-id":  "vice-proxy",
 	"group":   "org.cyverse",
 })
-
-func init() {
-	logrus.SetFormatter(&logrus.JSONFormatter{})
-}
 
 const sessionName = "proxy-session"
 const sessionKey = "proxy-session-key"
@@ -523,6 +519,8 @@ func (o *originFlags) Set(s string) error {
 }
 
 func main() {
+	logrus.SetReportCaller(true)
+
 	var (
 		corsOrigins             originFlags
 		backendURL              = flag.String("backend-url", "http://localhost:60000", "The hostname and port to proxy requests to.")
