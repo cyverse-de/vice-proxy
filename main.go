@@ -83,12 +83,14 @@ func (c *CASProxy) getResourceName(externalID string) (string, error) {
 		return "", err
 	}
 
+	log.Warnf("start of resource name lookup for %s at %s", externalID, c.getAnalysisIDBase)
 	client := &http.Client{}
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", err
 	}
 	defer resp.Body.Close()
+	log.Warnf("end of resource name lookup for %s at %s", externalID, c.getAnalysisIDBase)
 
 	analysis := &Analysis{}
 	b, err := ioutil.ReadAll(resp.Body)
@@ -158,12 +160,14 @@ func (c *CASProxy) IsAllowed(user, resource string) (bool, error) {
 		return false, err
 	}
 
+	log.Warnf("start of permissions lookup for user %s on resource %s at %s", user, resource, c.checkResourceAccessBase)
 	client := &http.Client{}
 	resp, err := client.Do(request)
 	if err != nil {
 		return false, err
 	}
 	defer resp.Body.Close()
+	log.Warnf("end of permissions lookup for user %s on resource %s at %s", user, resource, c.checkResourceAccessBase)
 
 	b, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
@@ -220,6 +224,8 @@ func (c *CASProxy) ValidateTicket(w http.ResponseWriter, r *http.Request) {
 	q.Add("ticket", r.URL.Query().Get("ticket"))
 	casURL.RawQuery = q.Encode()
 
+	log.Warnf("start of CAS ticket validation for %s at %s", r.URL.Query().Get("ticket"), casURL.String())
+
 	// Actually validate the ticket.
 	resp, err := http.Get(casURL.String())
 	if err != nil {
@@ -227,6 +233,8 @@ func (c *CASProxy) ValidateTicket(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusForbidden)
 		return
 	}
+
+	log.Warnf("end of CAS ticket validation for %s at %s", r.URL.Query().Get("ticket"), casURL.String())
 
 	// If this happens then something went wrong on the CAS side of things. Doesn't
 	// mean the ticket is invalid, just that the CAS server is in a state where
