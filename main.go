@@ -467,7 +467,7 @@ func (c *CASProxy) Proxy() (http.Handler, error) {
 	}
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		log.Warn("handling request for %s from remote address %s", r.URL.String(), r.RemoteAddr)
+		log.Warnf("handling request for %s from remote address %s", r.URL.String(), r.RemoteAddr)
 
 		//Get the username from the cookie
 		session, err := c.sessionStore.Get(r, sessionName)
