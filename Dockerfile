@@ -1,8 +1,6 @@
 # First stage
 FROM golang:1.12 as build-root
 
-RUN go get -u github.com/jstemmer/go-junit-report
-
 WORKDIR /build
 
 COPY go.mod .
@@ -16,27 +14,14 @@ ENV CGO_ENABLED=0
 ENV GOOS=linux
 ENV GOARCH=amd64
 
-RUN go build -ldflags "-X main.appver=$version -X main.gitref=$git_commit" ./...
-RUN sh -c "go test -v | tee /dev/stderr | go-junit-report > test-results.xml"
+RUN go build ./...
 
 ## Second stage
 FROM golang:1.12
 
-COPY --from=build-root /build/vice-proxy /
-COPY --from=build-root /build/test-results.xml /
+COPY --from=build-root /build/vice-proxy /bin/vice-proxy
 
-ENTRYPOINT ["/vice-proxy"]
+ENTRYPOINT ["vice-proxy"]
 CMD ["--help"]
 
 EXPOSE 8080
-
-ARG git_commit=unknown
-ARG version="2.9.0"
-ARG descriptive_version=unknown
-
-LABEL org.cyverse.git-ref="$git_commit"
-LABEL org.cyverse.version="$version"
-LABEL org.cyverse.descriptive-version="$descriptive_version"
-LABEL org.label-schema.vcs-ref="$git_commit"
-LABEL org.label-schema.vcs-url="https://github.com/cyverse-de/vice-proxy"
-LABEL org.label-schema.version="$descriptive_version"
