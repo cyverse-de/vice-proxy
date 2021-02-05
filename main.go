@@ -98,6 +98,10 @@ func (c *CASProxy) getResourceName(externalID string) (string, error) {
 		return "", err
 	}
 
+	if resp.StatusCode > 399 {
+		return "", fmt.Errorf(`status code %d from %s: %s`, resp.StatusCode, req.URL.String(), string(b))
+	}
+
 	if err = json.Unmarshal(b, analysis); err != nil {
 		return "", err
 	}
