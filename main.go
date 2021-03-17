@@ -13,8 +13,11 @@ import (
 	"path"
 	"strings"
 
+	"github.com/google/uuid"
 	"github.com/gorilla/mux"
 	"github.com/gorilla/sessions"
+	"github.com/lestrrat-go/jwx/jwk"
+	"github.com/lestrrat-go/jwx/jwt"
 	"github.com/pkg/errors"
 	"github.com/rs/cors"
 	"github.com/sirupsen/logrus"
@@ -27,6 +30,8 @@ var log = logrus.WithFields(logrus.Fields{
 	"group":   "org.cyverse",
 })
 
+const stateSessionName = "state-session"
+const stateSessionKey = "state-session-key"
 const sessionName = "proxy-session"
 const sessionKey = "proxy-session-key"
 const sessionAccess = "proxy-session-last-access"
@@ -36,26 +41,17 @@ const sessionAccess = "proxy-session-last-access"
 type CASProxy struct {
 	casBase                 string                // base URL for the CAS server
 	casValidate             string                // The path to the validation endpoint on the CAS server.
+	keycloakBaseURL         string                // The URL to use when checking for Keycloak authentication.
+	keycloakRealm           string                // The realm to use when checking for Keycloak authentication.
+	keycloakClientID        string                // The OIDC client ID for Keycloak.
+	keycloakClientSecret    string                // The OIDC client secret for Keycloak.
 	frontendURL             string                // The URL placed into service query param for CAS.
 	backendURL              string                // The backend URL to forward to.
 	wsbackendURL            string                // The websocket URL to forward requests to.
-	resourceType            string                // The resource type for analysis.
 	resourceName            string                // The UUID of the analysis.
 	getAnalysisIDBase       string                // The base URL for the get-analysis-id service.
 	checkResourceAccessBase string                // The base URL for the check-resource-access service.
 	sessionStore            *sessions.CookieStore // The backend session storage
-}
-
-// NewCASProxy returns a newly instantiated *CASProxy.
-func NewCASProxy(casBase, casValidate, frontendURL, backendURL, wsbackendURL string, cs *sessions.CookieStore) *CASProxy {
-	return &CASProxy{
-		casBase:      casBase,
-		casValidate:  casValidate,
-		frontendURL:  frontendURL,
-		backendURL:   backendURL,
-		wsbackendURL: wsbackendURL,
-		sessionStore: cs,
-	}
 }
 
 // Analysis contains the ID for the Analysis, which gets used as the resource
@@ -195,6 +191,236 @@ func (c *CASProxy) IsAllowed(user, resource string) (bool, error) {
 	return false, nil
 }
 
+// KeycloakURL generates a URL that we can use for Keycloak.
+func (c *CASProxy) KeycloakURL(components ...string) (*url.URL, error) {
+	keycloakURL, err := url.Parse(c.keycloakBaseURL)
+	if err != nil {
+		return nil, err
+	}
+
+	// Add the known parts of the URL.
+	cs := append(
+		[]string{keycloakURL.Path, "realms", c.keycloakRealm, "protocol", "openid-connect"},
+		components...,
+	)
+	keycloakURL.Path = strings.Join(cs, "/")
+
+	return keycloakURL, nil
+}
+
+// TokenResponse represents the response to an OpenID Connect token endpoint.
+type TokenResponse struct {
+	AccessToken      string `json:"access_token"`
+	TokenType        string `json:"token_type"`
+	RefreshToken     string `json:"refresh_token"`
+	ExpiresIn        int64  `json:"expires_in"`
+	RefreshExpiresIn int64  `json:"refresh_expires_in"`
+}
+
+// FetchKeycloakCerts calls Keycloak's certificate endpoint to get the set of signing certificates, and returns
+// the parsed certificate set.
+func (c *CASProxy) FetchKeycloakCerts() (jwk.Set, error) {
+	url, err := c.KeycloakURL("certs")
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := http.Get(url.String())
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	return jwk.Parse(body)
+}
+
+// ValidateKeycloakToken verifies the signature of a Keycloak token and returns a parsed version of it.
+func (c *CASProxy) ValidateKeycloakToken(encodedToken string) (jwt.Token, error) {
+	keySet, err := c.FetchKeycloakCerts()
+	if err != nil {
+		return nil, err
+	}
+
+	return jwt.Parse([]byte(encodedToken), jwt.WithKeySet(keySet))
+}
+
+// HandleAuthorizationCode accepts an authorization code in the query string and uses it to obtain an access token.
+func (c *CASProxy) HandleAuthorizationCode(w http.ResponseWriter, r *http.Request) {
+	var err error
+
+	// Validate the state query parameter to mitigate CSRF attacks.
+	actualState := r.URL.Query().Get("state")
+	if actualState == "" {
+		err = errors.Wrap(err, "no state found in query string")
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	session, err := c.sessionStore.Get(r, stateSessionName)
+	if err != nil {
+		err = errors.Wrap(err, "unable to get the state session")
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	expectedState, ok := session.Values[stateSessionKey]
+	if !ok {
+		err = fmt.Errorf("no state ID found in state session")
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if expectedState != actualState {
+		err = errors.Wrap(err, "expected state ID does not equal actual state ID")
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	// Extract the authorization code from the request URL.
+	code := r.URL.Query().Get("code")
+	if code == "" {
+		err = errors.Wrap(err, "authorization code not found in query string")
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Build the token URL.
+	tokenURL, err := c.KeycloakURL("token")
+	if err != nil {
+		err = errors.Wrap(err, "failed to create the Keycloak token URL")
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Build the redirect URL.
+	redirectURL, err := url.Parse(c.frontendURL)
+	if err != nil {
+		err = errors.Wrap(err, "failed to parse the frontend URL")
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	params := r.URL.Query()
+	params.Del("code")
+	params.Del("session_state")
+	params.Del("state")
+	redirectURL.RawQuery = params.Encode()
+	redirectURL.Path = r.URL.Path
+
+	// Build the form parameters.
+	formParams := url.Values{}
+	formParams.Set("grant_type", "authorization_code")
+	formParams.Set("code", code)
+	formParams.Set("redirect_uri", redirectURL.String())
+	formParams.Set("client_id", c.keycloakClientID)
+	formParams.Set("client_secret", c.keycloakClientSecret)
+
+	// Attempt to get the token.
+	resp, err := http.PostForm(tokenURL.String(), formParams)
+	if err != nil {
+		err = errors.Wrap(err, "failed to get the token from Keycloak")
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer resp.Body.Close()
+
+	// Extract the token from the response.
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		err = errors.Wrap(err, "failed to read the response from Keycloak")
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Parse the response body.
+	tokenResponse := &TokenResponse{}
+	err = json.Unmarshal(body, tokenResponse)
+	if err != nil {
+		err = errors.Wrap(err, "failed to parse the response from Keycloak")
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if tokenResponse.AccessToken == "" {
+		http.Error(w, "no access token returned in response from Keycloak", http.StatusInternalServerError)
+		return
+	}
+
+	// Validate the token.
+	token, err := c.ValidateKeycloakToken(tokenResponse.AccessToken)
+	if err != nil {
+		err = errors.Wrap(err, "failed to validate token from Keycloak")
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Get the username from the token.
+	username, ok := token.Get("preferred_username")
+	if !ok {
+		http.Error(w, "no username found in the token from Keycloak", http.StatusInternalServerError)
+		return
+	}
+
+	// Store the username in the session.
+	var s *sessions.Session
+	s, _ = c.sessionStore.Get(r, sessionName)
+	s.Values[sessionKey] = username
+	s.Save(r, w)
+
+	// Redirect the user to the redirect URL, which was determined above.
+	http.Redirect(w, r, redirectURL.String(), http.StatusTemporaryRedirect)
+}
+
+// CheckKeycloakAuth checks Keycloak to see if the user is currently logged in.
+func (c *CASProxy) CheckKeycloakAuth(w http.ResponseWriter, r *http.Request) {
+
+	// Generate a UUID for a state ID so that we can validate it later.
+	stateID, err := uuid.NewUUID()
+	if err != nil {
+		err = errors.Wrap(err, "failed to generate the state ID")
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	session, _ := c.sessionStore.Get(r, stateSessionName)
+	session.Values[stateSessionKey] = stateID.String()
+	err = session.Save(r, w)
+	if err != nil {
+		err = errors.Wrap(err, "failed to save the state ID in the session")
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Build the redirect URL.
+	redirectURL, err := url.Parse(c.frontendURL)
+	if err != nil {
+		err = errors.Wrapf(err, "failed to parse the frontend URL: %s", c.frontendURL)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	redirectURL.Path = r.URL.Path
+	redirectURL.RawQuery = r.URL.RawQuery
+
+	// Build the login URL and set the query parameters.
+	loginURL, err := c.KeycloakURL("auth")
+	if err != nil {
+		err = errors.Wrap(err, "failed to build the Keycloak authorization URL")
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	params := loginURL.Query()
+	params.Set("client_id", c.keycloakClientID)
+	params.Set("state", stateID.String())
+	params.Set("redirect_uri", redirectURL.String())
+	params.Set("scope", "openid")
+	params.Set("response_type", "code")
+	params.Set("response_mode", "query")
+	params.Set("prompt", "none")
+	loginURL.RawQuery = params.Encode()
+
+	// Redirect the user to the login URL.
+	http.Redirect(w, r, loginURL.String(), http.StatusTemporaryRedirect)
+}
+
 // ValidateTicket will validate a CAS ticket against the configured CAS server.
 func (c *CASProxy) ValidateTicket(w http.ResponseWriter, r *http.Request) {
 	casURL, err := url.Parse(c.casBase)
@@ -282,12 +508,7 @@ func (c *CASProxy) ValidateTicket(w http.ResponseWriter, r *http.Request) {
 	// the CAS server fairly often. Adjust the max age to rate limit requests to
 	// CAS.
 	var s *sessions.Session
-	s, err = c.sessionStore.Get(r, sessionName)
-	if err != nil {
-		err = errors.Wrap(err, "error getting session")
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
+	s, _ = c.sessionStore.Get(r, sessionName)
 	s.Values[sessionKey] = username
 	s.Save(r, w)
 
@@ -351,10 +572,13 @@ func (c *CASProxy) RedirectToCAS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Make sure the serivce path and the query params are set to the incoming
-	// requests values for those fields.
+	// Make sure the serivce path and the query params are set to the incoming requests
+	// values for those fields, excluding any query parameters used by Keycloak.
 	svcURL.Path = r.URL.Path
-	svcURL.RawQuery = r.URL.RawQuery
+	params := r.URL.Query()
+	params.Del("error")
+	params.Del("state")
+	svcURL.RawQuery = params.Encode()
 
 	//set the service query param in the casURL.
 	q := casURL.Query()
@@ -540,6 +764,10 @@ func main() {
 		listenAddr              = flag.String("listen-addr", "0.0.0.0:8080", "The listen port number.")
 		casBase                 = flag.String("cas-base-url", "", "The base URL to the CAS host.")
 		casValidate             = flag.String("cas-validate", "validate", "The CAS URL endpoint for validating tickets.")
+		keycloakBaseURL         = flag.String("keycloak-base-url", "", "The base URL to use when checking Keycloak authentication.")
+		keycloakRealm           = flag.String("keycloak-realm", "", "The realm to use when checking Keycloak authentication.")
+		keycloakClientID        = flag.String("keycloak-client-id", "", "The ID of the OIDC client to use for Keycloak.")
+		keycloakClientSecret    = flag.String("keycloak-client-secret", "", "The secret of the OIDC client to use for Keycloak.")
 		maxAge                  = flag.Int("max-age", 0, "The idle timeout for session, in seconds.")
 		sslCert                 = flag.String("ssl-cert", "", "Path to the SSL .crt file.")
 		sslKey                  = flag.String("ssl-key", "", "Path to the SSL .key file.")
@@ -594,6 +822,10 @@ func main() {
 	log.Infof("listen address is %s", *listenAddr)
 	log.Infof("CAS base URL is %s", *casBase)
 	log.Infof("CAS ticket validator endpoint is %s", *casValidate)
+	log.Infof("Keycloak base URL is %s", *keycloakBaseURL)
+	log.Infof("Keycloak realm is %s", *keycloakRealm)
+	log.Infof("Keycloak client ID is %s", *keycloakClientID)
+	log.Infof("Keycloak client secret is %s", *keycloakClientSecret)
 
 	for _, c := range corsOrigins {
 		log.Infof("Origin: %s\n", c)
@@ -615,6 +847,10 @@ func main() {
 	p := &CASProxy{
 		casBase:                 *casBase,
 		casValidate:             *casValidate,
+		keycloakBaseURL:         *keycloakBaseURL,
+		keycloakRealm:           *keycloakRealm,
+		keycloakClientID:        *keycloakClientID,
+		keycloakClientSecret:    *keycloakClientSecret,
 		frontendURL:             *frontendURL,
 		backendURL:              *backendURL,
 		wsbackendURL:            *wsbackendURL,
@@ -640,7 +876,9 @@ func main() {
 	// validated.
 	r.PathPrefix("/url-ready").HandlerFunc(p.URLIsReady)
 	r.PathPrefix("/").Queries("ticket", "").Handler(http.HandlerFunc(p.ValidateTicket))
-	r.PathPrefix("/").MatcherFunc(p.Session).Handler(http.HandlerFunc(p.RedirectToCAS))
+	r.PathPrefix("/").Queries("code", "").Handler(http.HandlerFunc(p.HandleAuthorizationCode))
+	r.PathPrefix("/").Queries("error", "login_required").HandlerFunc(p.RedirectToCAS)
+	r.PathPrefix("/").MatcherFunc(p.Session).Handler(http.HandlerFunc(p.CheckKeycloakAuth))
 	r.PathPrefix("/").Handler(proxy)
 
 	c := cors.New(cors.Options{
