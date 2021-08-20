@@ -3,6 +3,7 @@
 milestone 0
 timestamps {
     node('docker') {
+	checkout scm
         docker.withRegistry('https://harbor.cyverse.org', 'jenkins-harbor-credentials') {
             def dockerImage
             stage('Build') {
