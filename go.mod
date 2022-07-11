@@ -1,6 +1,6 @@
 module github.com/cyverse-de/vice-proxy
 
-go 1.12
+go 1.18
 
 require (
 	github.com/google/uuid v1.2.0
@@ -12,4 +12,21 @@ require (
 	github.com/sirupsen/logrus v1.4.2
 	github.com/stretchr/testify v1.6.1
 	github.com/yhat/wsutil v0.0.0-20150619204602-666b94ea38f2
+)
+
+require (
+	github.com/davecgh/go-spew v1.1.1 // indirect
+	github.com/decred/dcrd/dcrec/secp256k1/v3 v3.0.0 // indirect
+	github.com/goccy/go-json v0.4.7 // indirect
+	github.com/gorilla/context v1.1.1 // indirect
+	github.com/gorilla/securecookie v1.1.1 // indirect
+	github.com/konsorten/go-windows-terminal-sequences v1.0.1 // indirect
+	github.com/lestrrat-go/backoff/v2 v2.0.7 // indirect
+	github.com/lestrrat-go/httpcc v1.0.0 // indirect
+	github.com/lestrrat-go/iter v1.0.0 // indirect
+	github.com/lestrrat-go/option v1.0.0 // indirect
+	github.com/pmezard/go-difflib v1.0.0 // indirect
+	golang.org/x/crypto v0.0.0-20201217014255-9d1352758620 // indirect
+	golang.org/x/sys v0.0.0-20220708085239-5a0f0661e09d // indirect
+	gopkg.in/yaml.v3 v3.0.0-20200313102051-9f266ea9e77c // indirect
 )

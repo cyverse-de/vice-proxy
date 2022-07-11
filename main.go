@@ -256,24 +256,24 @@ func (c *CASProxy) HandleAuthorizationCode(w http.ResponseWriter, r *http.Reques
 	// Validate the state query parameter to mitigate CSRF attacks.
 	actualState := r.URL.Query().Get("state")
 	if actualState == "" {
-		err = errors.Wrap(err, "no state found in query string")
+		err = errors.New("no state found in query string")
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	session, err := c.sessionStore.Get(r, stateSessionName)
 	if err != nil {
-		err = errors.Wrap(err, "unable to get the state session")
+		err = errors.New("unable to get the state session")
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 	expectedState, ok := session.Values[stateSessionKey]
 	if !ok {
-		err = fmt.Errorf("no state ID found in state session")
+		err = errors.New("no state ID found in state session")
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 	if expectedState != actualState {
-		err = errors.Wrap(err, "expected state ID does not equal actual state ID")
+		err = errors.New("expected state ID does not equal actual state ID")
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -281,7 +281,7 @@ func (c *CASProxy) HandleAuthorizationCode(w http.ResponseWriter, r *http.Reques
 	// Extract the authorization code from the request URL.
 	code := r.URL.Query().Get("code")
 	if code == "" {
-		err = errors.Wrap(err, "authorization code not found in query string")
+		err = errors.New("authorization code not found in query string")
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
