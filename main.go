@@ -247,45 +247,56 @@ func (c *VICEProxy) ValidateKeycloakToken(encodedToken string) (jwt.Token, error
 
 // HandleAuthorizationCode accepts an authorization code in the query string and uses it to obtain an access token.
 func (c *VICEProxy) HandleAuthorizationCode(w http.ResponseWriter, r *http.Request) {
+	log.Debug("validating an authorization code received from Keycloak")
 	var err error
 
 	// Validate the state query parameter to mitigate CSRF attacks.
 	actualState := r.URL.Query().Get("state")
 	if actualState == "" {
 		err = errors.New("no state found in query string")
+		log.Error(err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	log.Debugf("state query parameter value: %s", actualState)
 	session, err := c.sessionStore.Get(r, stateSessionName)
 	if err != nil {
 		err = errors.New("unable to get the state session")
+		log.Error(err)
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 	expectedState, ok := session.Values[stateSessionKey]
 	if !ok {
 		err = errors.New("no state ID found in state session")
+		log.Error(err)
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	log.Debugf("expected state value: %s", expectedState)
 	if expectedState != actualState {
 		err = errors.New("expected state ID does not equal actual state ID")
+		log.Error(err)
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
 	// Extract the authorization code from the request URL.
 	code := r.URL.Query().Get("code")
+	log.Debugf("authorization code: %s", code)
 	if code == "" {
 		err = errors.New("authorization code not found in query string")
+		log.Error(err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
 	// Build the token URL.
 	tokenURL, err := c.KeycloakURL("token")
+	log.Debugf("token URL: %s", tokenURL.String())
 	if err != nil {
 		err = errors.Wrap(err, "failed to create the Keycloak token URL")
+		log.Error(err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -294,6 +305,7 @@ func (c *VICEProxy) HandleAuthorizationCode(w http.ResponseWriter, r *http.Reque
 	redirectURL, err := url.Parse(c.frontendURL)
 	if err != nil {
 		err = errors.Wrap(err, "failed to parse the frontend URL")
+		log.Error(err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -303,6 +315,7 @@ func (c *VICEProxy) HandleAuthorizationCode(w http.ResponseWriter, r *http.Reque
 	params.Del("state")
 	redirectURL.RawQuery = params.Encode()
 	redirectURL.Path = r.URL.Path
+	log.Debugf("redirect URL: %s", redirectURL.String())
 
 	// Build the form parameters.
 	formParams := url.Values{}
@@ -311,11 +324,14 @@ func (c *VICEProxy) HandleAuthorizationCode(w http.ResponseWriter, r *http.Reque
 	formParams.Set("redirect_uri", redirectURL.String())
 	formParams.Set("client_id", c.keycloakClientID)
 	formParams.Set("client_secret", c.keycloakClientSecret)
+	log.Debugf("form params: %s", formParams.Encode())
 
 	// Attempt to get the token.
+	log.Debug("attempting to exchange the authorization code for a token")
 	resp, err := http.PostForm(tokenURL.String(), formParams)
 	if err != nil {
 		err = errors.Wrap(err, "failed to get the token from Keycloak")
+		log.Error(err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -325,6 +341,7 @@ func (c *VICEProxy) HandleAuthorizationCode(w http.ResponseWriter, r *http.Reque
 	body, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
 		err = errors.Wrap(err, "failed to read the response from Keycloak")
+		log.Error(err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -334,18 +351,23 @@ func (c *VICEProxy) HandleAuthorizationCode(w http.ResponseWriter, r *http.Reque
 	err = json.Unmarshal(body, tokenResponse)
 	if err != nil {
 		err = errors.Wrap(err, "failed to parse the response from Keycloak")
+		log.Error(err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	if tokenResponse.AccessToken == "" {
-		http.Error(w, "no access token returned in response from Keycloak", http.StatusInternalServerError)
+		err = fmt.Errorf("no access token found in response from Keycloak")
+		log.Error(err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	log.Debug("access token: %s", tokenResponse.AccessToken)
 
 	// Validate the token.
 	token, err := c.ValidateKeycloakToken(tokenResponse.AccessToken)
 	if err != nil {
 		err = errors.Wrap(err, "failed to validate token from Keycloak")
+		log.Error(err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -353,7 +375,9 @@ func (c *VICEProxy) HandleAuthorizationCode(w http.ResponseWriter, r *http.Reque
 	// Get the username from the token.
 	username, ok := token.Get("preferred_username")
 	if !ok {
-		http.Error(w, "no username found in the token from Keycloak", http.StatusInternalServerError)
+		err = fmt.Errorf("no username found in the token from Keycloak")
+		log.Error(err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
@@ -364,11 +388,13 @@ func (c *VICEProxy) HandleAuthorizationCode(w http.ResponseWriter, r *http.Reque
 	s.Save(r, w)
 
 	// Redirect the user to the redirect URL, which was determined above.
+	log.Debugf("redirecting the user to: %s", redirectURL.String())
 	http.Redirect(w, r, redirectURL.String(), http.StatusTemporaryRedirect)
 }
 
 // RequireKeycloakAuth ensures that the user is logged in via Keycloak.
 func (c *VICEProxy) RequireKeycloakAuth(w http.ResponseWriter, r *http.Request) {
+	log.Info("redirecting user to Keycloak for authentication")
 
 	// Generate a UUID for a state ID so that we can validate it later.
 	stateID, err := uuid.NewUUID()
@@ -385,6 +411,7 @@ func (c *VICEProxy) RequireKeycloakAuth(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	log.Debugf("generated state ID: %s", stateID.String())
 
 	// Build the redirect URL.
 	redirectURL, err := url.Parse(c.frontendURL)
@@ -395,6 +422,7 @@ func (c *VICEProxy) RequireKeycloakAuth(w http.ResponseWriter, r *http.Request) 
 	}
 	redirectURL.Path = r.URL.Path
 	redirectURL.RawQuery = r.URL.RawQuery
+	log.Debugf("redirect URL: %s", redirectURL.String())
 
 	// Build the login URL and set the query parameters.
 	loginURL, err := c.KeycloakURL("auth")
@@ -412,6 +440,7 @@ func (c *VICEProxy) RequireKeycloakAuth(w http.ResponseWriter, r *http.Request) 
 	loginURL.RawQuery = params.Encode()
 
 	// Redirect the user to the login URL.
+	log.Debugf("redirecting the user to %s", loginURL.String())
 	http.Redirect(w, r, loginURL.String(), http.StatusTemporaryRedirect)
 }
 
