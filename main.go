@@ -338,7 +338,9 @@ func (c *VICEProxy) HandleAuthorizationCode(w http.ResponseWriter, r *http.Reque
 	defer resp.Body.Close()
 
 	// Extract the token from the response.
+	log.Debug("reading the response from Keycloak")
 	body, err := ioutil.ReadAll(resp.Body)
+	log.Debug("finished reading the response from Keycloak")
 	if err != nil {
 		err = errors.Wrap(err, "failed to read the response from Keycloak")
 		log.Error(err)
