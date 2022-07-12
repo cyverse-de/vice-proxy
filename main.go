@@ -660,7 +660,7 @@ func (c *VICEProxy) URLIsReady(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if ready {
-		fmt.Fprintf(w, string(body))
+		fmt.Fprint(w, string(body))
 	} else {
 		http.Error(w, string(body), http.StatusNotAcceptable)
 	}
