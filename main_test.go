@@ -6,12 +6,10 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-// getCASProxy returns a CASProxy instance with some default settnigs for testing. Some fields that aren't being used
+// getVICEProxy returns a VICEProxy instance with some default settnigs for testing. Some fields that aren't being used
 // during testing are omitted.
-func getCASProxy() *CASProxy {
-	return &CASProxy{
-		casBase:                 "https://cas.example.org/cas",
-		casValidate:             "validate",
+func getVICEProxy() *VICEProxy {
+	return &VICEProxy{
 		keycloakBaseURL:         "https://keycloak.example.org",
 		keycloakRealm:           "example",
 		keycloakClientID:        "example-client",
@@ -58,7 +56,7 @@ func TestKeycloakURL(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.description, func(t *testing.T) {
 			assert := assert.New(t)
-			proxy := getCASProxy()
+			proxy := getVICEProxy()
 
 			// Build the actual URL.
 			actualURL, err := proxy.KeycloakURL(test.components...)
