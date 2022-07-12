@@ -36,9 +36,9 @@ const sessionName = "proxy-session"
 const sessionKey = "proxy-session-key"
 const sessionAccess = "proxy-session-last-access"
 
-// CASProxy contains the application logic that handles authentication, session
+// VICEProxy contains the application logic that handles authentication, session
 // validations, ticket validation, and request proxying.
-type CASProxy struct {
+type VICEProxy struct {
 	casBase                 string                // base URL for the CAS server
 	casValidate             string                // The path to the validation endpoint on the CAS server.
 	keycloakBaseURL         string                // The URL to use when checking for Keycloak authentication.
@@ -65,7 +65,7 @@ type Analyses struct {
 	Analyses []Analysis `json:"analyses"`
 }
 
-func (c *CASProxy) getResourceName(externalID string) (string, error) {
+func (c *VICEProxy) getResourceName(externalID string) (string, error) {
 	bodymap := map[string]string{}
 	bodymap["external_id"] = externalID
 
@@ -144,7 +144,7 @@ type PermissionList struct {
 // IsAllowed will return true if the user is allowed to access the running app
 // and false if they're not. An error might be returned as well. Access should
 // be denied if an error is returned, even if the boolean return value is true.
-func (c *CASProxy) IsAllowed(user, resource string) (bool, error) {
+func (c *VICEProxy) IsAllowed(user, resource string) (bool, error) {
 	bodymap := map[string]string{
 		"subject":  user,
 		"resource": resource,
@@ -192,7 +192,7 @@ func (c *CASProxy) IsAllowed(user, resource string) (bool, error) {
 }
 
 // KeycloakURL generates a URL that we can use for Keycloak.
-func (c *CASProxy) KeycloakURL(components ...string) (*url.URL, error) {
+func (c *VICEProxy) KeycloakURL(components ...string) (*url.URL, error) {
 	keycloakURL, err := url.Parse(c.keycloakBaseURL)
 	if err != nil {
 		return nil, err
@@ -219,7 +219,7 @@ type TokenResponse struct {
 
 // FetchKeycloakCerts calls Keycloak's certificate endpoint to get the set of signing certificates, and returns
 // the parsed certificate set.
-func (c *CASProxy) FetchKeycloakCerts() (jwk.Set, error) {
+func (c *VICEProxy) FetchKeycloakCerts() (jwk.Set, error) {
 	url, err := c.KeycloakURL("certs")
 	if err != nil {
 		return nil, err
@@ -240,7 +240,7 @@ func (c *CASProxy) FetchKeycloakCerts() (jwk.Set, error) {
 }
 
 // ValidateKeycloakToken verifies the signature of a Keycloak token and returns a parsed version of it.
-func (c *CASProxy) ValidateKeycloakToken(encodedToken string) (jwt.Token, error) {
+func (c *VICEProxy) ValidateKeycloakToken(encodedToken string) (jwt.Token, error) {
 	keySet, err := c.FetchKeycloakCerts()
 	if err != nil {
 		return nil, err
@@ -250,7 +250,7 @@ func (c *CASProxy) ValidateKeycloakToken(encodedToken string) (jwt.Token, error)
 }
 
 // HandleAuthorizationCode accepts an authorization code in the query string and uses it to obtain an access token.
-func (c *CASProxy) HandleAuthorizationCode(w http.ResponseWriter, r *http.Request) {
+func (c *VICEProxy) HandleAuthorizationCode(w http.ResponseWriter, r *http.Request) {
 	var err error
 
 	// Validate the state query parameter to mitigate CSRF attacks.
@@ -372,7 +372,7 @@ func (c *CASProxy) HandleAuthorizationCode(w http.ResponseWriter, r *http.Reques
 }
 
 // CheckKeycloakAuth checks Keycloak to see if the user is currently logged in.
-func (c *CASProxy) CheckKeycloakAuth(w http.ResponseWriter, r *http.Request) {
+func (c *VICEProxy) CheckKeycloakAuth(w http.ResponseWriter, r *http.Request) {
 
 	// Generate a UUID for a state ID so that we can validate it later.
 	stateID, err := uuid.NewUUID()
@@ -422,7 +422,7 @@ func (c *CASProxy) CheckKeycloakAuth(w http.ResponseWriter, r *http.Request) {
 }
 
 // ValidateTicket will validate a CAS ticket against the configured CAS server.
-func (c *CASProxy) ValidateTicket(w http.ResponseWriter, r *http.Request) {
+func (c *VICEProxy) ValidateTicket(w http.ResponseWriter, r *http.Request) {
 	casURL, err := url.Parse(c.casBase)
 	if err != nil {
 		err = errors.Wrapf(err, "failed to parse CAS base URL %s", c.casBase)
@@ -516,7 +516,7 @@ func (c *CASProxy) ValidateTicket(w http.ResponseWriter, r *http.Request) {
 }
 
 // ResetSessionExpiration should reset the session expiration time.
-func (c *CASProxy) ResetSessionExpiration(w http.ResponseWriter, r *http.Request) error {
+func (c *VICEProxy) ResetSessionExpiration(w http.ResponseWriter, r *http.Request) error {
 	session, err := c.sessionStore.Get(r, sessionName)
 	if err != nil {
 		return err
@@ -534,7 +534,7 @@ func (c *CASProxy) ResetSessionExpiration(w http.ResponseWriter, r *http.Request
 
 // Session implements the mux.Matcher interface so that requests can be routed
 // based on cookie existence.
-func (c *CASProxy) Session(r *http.Request, m *mux.RouteMatch) bool {
+func (c *VICEProxy) Session(r *http.Request, m *mux.RouteMatch) bool {
 	session, err := c.sessionStore.Get(r, sessionName)
 	if err != nil {
 		return true
@@ -555,7 +555,7 @@ func (c *CASProxy) Session(r *http.Request, m *mux.RouteMatch) bool {
 
 // RedirectToCAS redirects the request to CAS, setting the service query
 // parameter to the value in frontendURL.
-func (c *CASProxy) RedirectToCAS(w http.ResponseWriter, r *http.Request) {
+func (c *VICEProxy) RedirectToCAS(w http.ResponseWriter, r *http.Request) {
 	casURL, err := url.Parse(c.casBase)
 	if err != nil {
 		err = errors.Wrapf(err, "failed to parse CAS base URL %s", c.casBase)
@@ -593,7 +593,7 @@ func (c *CASProxy) RedirectToCAS(w http.ResponseWriter, r *http.Request) {
 
 // ReverseProxy returns a proxy that forwards requests to the configured
 // backend URL. It can act as a http.Handler.
-func (c *CASProxy) ReverseProxy() (*httputil.ReverseProxy, error) {
+func (c *VICEProxy) ReverseProxy() (*httputil.ReverseProxy, error) {
 	backend, err := url.Parse(c.backendURL)
 	if err != nil {
 		return nil, errors.Wrapf(err, "failed to parse %s", c.backendURL)
@@ -603,7 +603,7 @@ func (c *CASProxy) ReverseProxy() (*httputil.ReverseProxy, error) {
 
 // WSReverseProxy returns a proxy that forwards websocket request to the
 // configured backend URL. It can act as a http.Handler.
-func (c *CASProxy) WSReverseProxy() (*wsutil.ReverseProxy, error) {
+func (c *VICEProxy) WSReverseProxy() (*wsutil.ReverseProxy, error) {
 	w, err := url.Parse(c.wsbackendURL)
 	if err != nil {
 		return nil, errors.Wrapf(err, "failed to parse the websocket backend URL %s", c.wsbackendURL)
@@ -613,7 +613,7 @@ func (c *CASProxy) WSReverseProxy() (*wsutil.ReverseProxy, error) {
 
 // isWebsocket returns true if the connection is a websocket request. Adapted
 // from the code at https://groups.google.com/d/msg/golang-nuts/KBx9pDlvFOc/0tR1gBRfFVMJ.
-func (c *CASProxy) isWebsocket(r *http.Request) bool {
+func (c *VICEProxy) isWebsocket(r *http.Request) bool {
 	connectionHeader := ""
 	allHeaders := r.Header["Connection"]
 	if len(allHeaders) > 0 {
@@ -629,7 +629,7 @@ func (c *CASProxy) isWebsocket(r *http.Request) bool {
 	return upgrade
 }
 
-func (c *CASProxy) backendIsReady(backendURL string) (bool, error) {
+func (c *VICEProxy) backendIsReady(backendURL string) (bool, error) {
 	resp, err := http.Get(backendURL)
 	if err != nil {
 		return false, err
@@ -644,7 +644,7 @@ func (c *CASProxy) backendIsReady(backendURL string) (bool, error) {
 // URLIsReady will write out a JSON-encoded response in the format
 // {"ready":boolean}, telling whether or not the underlying application is ready
 // for business yet.
-func (c *CASProxy) URLIsReady(w http.ResponseWriter, r *http.Request) {
+func (c *VICEProxy) URLIsReady(w http.ResponseWriter, r *http.Request) {
 	ready, err := c.backendIsReady(c.backendURL)
 	if err != nil {
 		log.Error(err)
@@ -668,7 +668,7 @@ func (c *CASProxy) URLIsReady(w http.ResponseWriter, r *http.Request) {
 }
 
 // GetFrontendHost returns the host and port portions of the resource name.
-func (c *CASProxy) GetFrontendHost() (string, error) {
+func (c *VICEProxy) GetFrontendHost() (string, error) {
 	svcURL, err := url.Parse(c.frontendURL)
 	if err != nil {
 		return "", errors.Wrapf(err, "failed to parse the frontend URL %s", c.frontendURL)
@@ -678,7 +678,7 @@ func (c *CASProxy) GetFrontendHost() (string, error) {
 }
 
 // Proxy returns a handler that can support both websockets and http requests.
-func (c *CASProxy) Proxy() (http.Handler, error) {
+func (c *VICEProxy) Proxy() (http.Handler, error) {
 	ws, err := c.WSReverseProxy()
 	if err != nil {
 		return nil, err
@@ -844,7 +844,7 @@ func main() {
 		HttpOnly: true,
 	}
 
-	p := &CASProxy{
+	p := &VICEProxy{
 		casBase:                 *casBase,
 		casValidate:             *casValidate,
 		keycloakBaseURL:         *keycloakBaseURL,
