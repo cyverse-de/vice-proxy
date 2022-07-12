@@ -646,6 +646,7 @@ func (o *originFlags) Set(s string) error {
 
 func main() {
 	logrus.SetReportCaller(true)
+	logrus.SetLevel(logrus.DebugLevel)
 
 	var (
 		corsOrigins             originFlags
