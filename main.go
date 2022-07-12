@@ -34,7 +34,6 @@ const stateSessionName = "state-session"
 const stateSessionKey = "state-session-key"
 const sessionName = "proxy-session"
 const sessionKey = "proxy-session-key"
-const sessionAccess = "proxy-session-last-access"
 
 // VICEProxy contains the application logic that handles authentication, session
 // validations, ticket validation, and request proxying.
