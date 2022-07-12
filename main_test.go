@@ -10,8 +10,6 @@ import (
 // during testing are omitted.
 func getVICEProxy() *VICEProxy {
 	return &VICEProxy{
-		casBase:                 "https://cas.example.org/cas",
-		casValidate:             "validate",
 		keycloakBaseURL:         "https://keycloak.example.org",
 		keycloakRealm:           "example",
 		keycloakClientID:        "example-client",

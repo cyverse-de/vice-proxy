@@ -10,7 +10,6 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
-	"path"
 	"strings"
 
 	"github.com/google/uuid"
@@ -38,13 +37,11 @@ const sessionKey = "proxy-session-key"
 // VICEProxy contains the application logic that handles authentication, session
 // validations, ticket validation, and request proxying.
 type VICEProxy struct {
-	casBase                 string                // base URL for the CAS server
-	casValidate             string                // The path to the validation endpoint on the CAS server.
 	keycloakBaseURL         string                // The URL to use when checking for Keycloak authentication.
 	keycloakRealm           string                // The realm to use when checking for Keycloak authentication.
 	keycloakClientID        string                // The OIDC client ID for Keycloak.
 	keycloakClientSecret    string                // The OIDC client secret for Keycloak.
-	frontendURL             string                // The URL placed into service query param for CAS.
+	frontendURL             string                // The redirect URL.
 	backendURL              string                // The backend URL to forward to.
 	wsbackendURL            string                // The websocket URL to forward requests to.
 	resourceName            string                // The UUID of the analysis.
@@ -370,8 +367,8 @@ func (c *VICEProxy) HandleAuthorizationCode(w http.ResponseWriter, r *http.Reque
 	http.Redirect(w, r, redirectURL.String(), http.StatusTemporaryRedirect)
 }
 
-// CheckKeycloakAuth checks Keycloak to see if the user is currently logged in.
-func (c *VICEProxy) CheckKeycloakAuth(w http.ResponseWriter, r *http.Request) {
+// RequireKeycloakAuth ensures that the user is logged in via Keycloak.
+func (c *VICEProxy) RequireKeycloakAuth(w http.ResponseWriter, r *http.Request) {
 
 	// Generate a UUID for a state ID so that we can validate it later.
 	stateID, err := uuid.NewUUID()
@@ -412,106 +409,10 @@ func (c *VICEProxy) CheckKeycloakAuth(w http.ResponseWriter, r *http.Request) {
 	params.Set("redirect_uri", redirectURL.String())
 	params.Set("scope", "openid")
 	params.Set("response_type", "code")
-	params.Set("response_mode", "query")
-	params.Set("prompt", "none")
 	loginURL.RawQuery = params.Encode()
 
 	// Redirect the user to the login URL.
 	http.Redirect(w, r, loginURL.String(), http.StatusTemporaryRedirect)
-}
-
-// ValidateTicket will validate a CAS ticket against the configured CAS server.
-func (c *VICEProxy) ValidateTicket(w http.ResponseWriter, r *http.Request) {
-	casURL, err := url.Parse(c.casBase)
-	if err != nil {
-		err = errors.Wrapf(err, "failed to parse CAS base URL %s", c.casBase)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	// Make sure the path in the CAS params is the same as the one that was
-	// requested.
-	svcURL, err := url.Parse(c.frontendURL)
-	if err != nil {
-		err = errors.Wrapf(err, "failed to parse the frontend URL %s", c.frontendURL)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	// Ensure that the service path and the query params are set to the incoming
-	// request's values for those fields.
-	svcURL.Path = r.URL.Path
-	sq := r.URL.Query()
-	sq.Del("ticket") // Remove the ticket from the service URL. Redirection loops occur otherwise.
-	svcURL.RawQuery = sq.Encode()
-
-	// The request URL for CAS ticket validation needs to have the service and
-	// ticket in it.
-	casURL.Path = path.Join(casURL.Path, c.casValidate)
-	q := casURL.Query()
-	q.Add("service", svcURL.String())
-	q.Add("ticket", r.URL.Query().Get("ticket"))
-	casURL.RawQuery = q.Encode()
-
-	log.Warnf("start of CAS ticket validation for %s at %s", r.URL.Query().Get("ticket"), casURL.String())
-
-	// Actually validate the ticket.
-	resp, err := http.Get(casURL.String())
-	if err != nil {
-		err = errors.Wrap(err, "ticket validation error")
-		http.Error(w, err.Error(), http.StatusForbidden)
-		return
-	}
-
-	log.Warnf("end of CAS ticket validation for %s at %s", r.URL.Query().Get("ticket"), casURL.String())
-
-	// If this happens then something went wrong on the CAS side of things. Doesn't
-	// mean the ticket is invalid, just that the CAS server is in a state where
-	// we can't trust the response.
-	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		err = errors.Wrapf(err, "ticket validation status code was %d", resp.StatusCode)
-		http.Error(w, err.Error(), http.StatusForbidden)
-		return
-	}
-
-	b, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		err = errors.Wrap(err, "error reading body of CAS response")
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	defer resp.Body.Close()
-
-	// This is where the actual ticket validation happens. If the CAS server
-	// returns 'no\n\n' in the body, then the validation was not successful. The
-	// HTTP status code will be in the 200 range regardless of the validation
-	// status.
-	if bytes.Equal(b, []byte("no\n\n")) {
-		err = fmt.Errorf("ticket validation response body was %s", b)
-		http.Error(w, err.Error(), http.StatusForbidden)
-		return
-	}
-
-	fields := bytes.Fields(b)
-	if len(fields) < 2 {
-		err = errors.New("not enough fields in ticket validation response body")
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	username := string(fields[1])
-
-	// Store a session, hopefully to short-circuit the CAS redirect dance in later
-	// requests. The max age of the cookie should be less than the lifetime of
-	// the CAS ticket, which is around 10+ hours. This means that we'll be hitting
-	// the CAS server fairly often. Adjust the max age to rate limit requests to
-	// CAS.
-	var s *sessions.Session
-	s, _ = c.sessionStore.Get(r, sessionName)
-	s.Values[sessionKey] = username
-	s.Save(r, w)
-
-	http.Redirect(w, r, svcURL.String(), http.StatusFound)
 }
 
 // ResetSessionExpiration should reset the session expiration time.
@@ -550,44 +451,6 @@ func (c *VICEProxy) Session(r *http.Request, m *mux.RouteMatch) bool {
 	}
 
 	return false
-}
-
-// RedirectToCAS redirects the request to CAS, setting the service query
-// parameter to the value in frontendURL.
-func (c *VICEProxy) RedirectToCAS(w http.ResponseWriter, r *http.Request) {
-	casURL, err := url.Parse(c.casBase)
-	if err != nil {
-		err = errors.Wrapf(err, "failed to parse CAS base URL %s", c.casBase)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	// Make sure the path in the CAS params is the same as the one that was
-	// requested.
-	svcURL, err := url.Parse(c.frontendURL)
-	if err != nil {
-		err = errors.Wrapf(err, "failed to parse the frontend URL %s", c.frontendURL)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	// Make sure the serivce path and the query params are set to the incoming requests
-	// values for those fields, excluding any query parameters used by Keycloak.
-	svcURL.Path = r.URL.Path
-	params := r.URL.Query()
-	params.Del("error")
-	params.Del("state")
-	svcURL.RawQuery = params.Encode()
-
-	//set the service query param in the casURL.
-	q := casURL.Query()
-	q.Add("service", svcURL.String())
-	casURL.RawQuery = q.Encode()
-	casURL.Path = path.Join(casURL.Path, "login")
-
-	// perform the redirect
-	log.Warnf("redirecting to CAS server at %s with status code %d", casURL.String(), http.StatusTemporaryRedirect)
-	http.Redirect(w, r, casURL.String(), http.StatusTemporaryRedirect)
 }
 
 // ReverseProxy returns a proxy that forwards requests to the configured
@@ -761,8 +624,6 @@ func main() {
 		wsbackendURL            = flag.String("ws-backend-url", "", "The backend URL for the handling websocket requests. Defaults to the value of --backend-url with a scheme of ws://")
 		frontendURL             = flag.String("frontend-url", "", "The URL for the frontend server. Might be different from the hostname and listen port.")
 		listenAddr              = flag.String("listen-addr", "0.0.0.0:8080", "The listen port number.")
-		casBase                 = flag.String("cas-base-url", "", "The base URL to the CAS host.")
-		casValidate             = flag.String("cas-validate", "validate", "The CAS URL endpoint for validating tickets.")
 		keycloakBaseURL         = flag.String("keycloak-base-url", "", "The base URL to use when checking Keycloak authentication.")
 		keycloakRealm           = flag.String("keycloak-realm", "", "The realm to use when checking Keycloak authentication.")
 		keycloakClientID        = flag.String("keycloak-client-id", "", "The ID of the OIDC client to use for Keycloak.")
@@ -777,10 +638,6 @@ func main() {
 
 	flag.Var(&corsOrigins, "allowed-origins", "List of allowed origins, separated by commas.")
 	flag.Parse()
-
-	if *casBase == "" {
-		log.Fatal("--cas-base-url must be set.")
-	}
 
 	if *frontendURL == "" {
 		log.Fatal("--frontend-url must be set.")
@@ -819,8 +676,6 @@ func main() {
 	log.Infof("websocket backend URL is %s", *wsbackendURL)
 	log.Infof("frontend URL is %s", *frontendURL)
 	log.Infof("listen address is %s", *listenAddr)
-	log.Infof("CAS base URL is %s", *casBase)
-	log.Infof("CAS ticket validator endpoint is %s", *casValidate)
 	log.Infof("Keycloak base URL is %s", *keycloakBaseURL)
 	log.Infof("Keycloak realm is %s", *keycloakRealm)
 	log.Infof("Keycloak client ID is %s", *keycloakClientID)
@@ -844,8 +699,6 @@ func main() {
 	}
 
 	p := &VICEProxy{
-		casBase:                 *casBase,
-		casValidate:             *casValidate,
 		keycloakBaseURL:         *keycloakBaseURL,
 		keycloakRealm:           *keycloakRealm,
 		keycloakClientID:        *keycloakClientID,
@@ -874,10 +727,8 @@ func main() {
 	// If the query contains a ticket in the query params, then it needs to be
 	// validated.
 	r.PathPrefix("/url-ready").HandlerFunc(p.URLIsReady)
-	r.PathPrefix("/").Queries("ticket", "").Handler(http.HandlerFunc(p.ValidateTicket))
 	r.PathPrefix("/").Queries("code", "").Handler(http.HandlerFunc(p.HandleAuthorizationCode))
-	r.PathPrefix("/").Queries("error", "login_required").HandlerFunc(p.RedirectToCAS)
-	r.PathPrefix("/").MatcherFunc(p.Session).Handler(http.HandlerFunc(p.CheckKeycloakAuth))
+	r.PathPrefix("/").MatcherFunc(p.Session).Handler(http.HandlerFunc(p.RequireKeycloakAuth))
 	r.PathPrefix("/").Handler(proxy)
 
 	c := cors.New(cors.Options{
