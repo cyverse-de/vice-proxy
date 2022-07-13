@@ -11,6 +11,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/gorilla/mux"
@@ -47,7 +48,8 @@ type VICEProxy struct {
 	resourceName            string                // The UUID of the analysis.
 	getAnalysisIDBase       string                // The base URL for the get-analysis-id service.
 	checkResourceAccessBase string                // The base URL for the check-resource-access service.
-	sessionStore            *sessions.CookieStore // The backend session storage
+	sessionStore            *sessions.CookieStore // The backend session storage.
+	ssoClient               http.Client           // The HTTP client for back-channel requests to the IDP.
 }
 
 // Analysis contains the ID for the Analysis, which gets used as the resource
@@ -221,7 +223,7 @@ func (c *VICEProxy) FetchKeycloakCerts() (jwk.Set, error) {
 		return nil, err
 	}
 
-	resp, err := http.Get(url.String())
+	resp, err := c.ssoClient.Get(url.String())
 	if err != nil {
 		return nil, err
 	}
@@ -328,7 +330,7 @@ func (c *VICEProxy) HandleAuthorizationCode(w http.ResponseWriter, r *http.Reque
 
 	// Attempt to get the token.
 	log.Debug("attempting to exchange the authorization code for a token")
-	resp, err := http.PostForm(tokenURL.String(), formParams)
+	resp, err := c.ssoClient.PostForm(tokenURL.String(), formParams)
 	if err != nil {
 		err = errors.Wrap(err, "failed to get the token from Keycloak")
 		log.Error(err)
@@ -666,6 +668,7 @@ func main() {
 		getAnalysisIDBase       = flag.String("get-analysis-id-base", "http://get-analysis-id", "The base URL for the get-analysis-id service.")
 		checkResourceAccessBase = flag.String("check-resource-access-base", "http://check-resource-access", "The base URL for the check-resource-access service.")
 		externalID              = flag.String("external-id", "", "The external ID to pass to the apps service when looking up the analysis ID.")
+		encodedSSOTimeout       = flag.String("sso-timeout", "5s", "The timeout period for back-channel requests to the identity provider.")
 	)
 
 	flag.Var(&corsOrigins, "allowed-origins", "List of allowed origins, separated by commas.")
@@ -730,6 +733,17 @@ func main() {
 		HttpOnly: true,
 	}
 
+	// Decode the timeout duration for back-channel requests to the identity provider.
+	ssoTimeout, err := time.ParseDuration(*encodedSSOTimeout)
+	if err != nil {
+		log.Fatal("invalid timeout duration for back-channel requests to the IdP: %s", err.Error())
+	}
+
+	// Create an HTTP client to use for back-channel requests to the identity provider.
+	client := &http.Client{
+		Timeout: ssoTimeout,
+	}
+
 	p := &VICEProxy{
 		keycloakBaseURL:         *keycloakBaseURL,
 		keycloakRealm:           *keycloakRealm,
@@ -741,6 +755,7 @@ func main() {
 		getAnalysisIDBase:       *getAnalysisIDBase,
 		checkResourceAccessBase: *checkResourceAccessBase,
 		sessionStore:            sessionStore,
+		ssoClient:               *client,
 	}
 
 	resourceName, err := p.getResourceName(*externalID)
