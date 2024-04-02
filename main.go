@@ -6,7 +6,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -87,7 +87,7 @@ func (c *VICEProxy) getResourceName(externalID string) (string, error) {
 	log.Warnf("end of resource name lookup for %s at %s", externalID, c.getAnalysisIDBase)
 
 	analysis := &Analysis{}
-	b, err := ioutil.ReadAll(resp.Body)
+	b, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return "", err
 	}
@@ -167,7 +167,7 @@ func (c *VICEProxy) IsAllowed(user, resource string) (bool, error) {
 	defer resp.Body.Close()
 	log.Warnf("end of permissions lookup for user %s on resource %s at %s", user, resource, c.checkResourceAccessBase)
 
-	b, err := ioutil.ReadAll(resp.Body)
+	b, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return false, err
 	}
@@ -229,7 +229,7 @@ func (c *VICEProxy) FetchKeycloakCerts() (jwk.Set, error) {
 	}
 	defer resp.Body.Close()
 
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, err
 	}
@@ -341,7 +341,7 @@ func (c *VICEProxy) HandleAuthorizationCode(w http.ResponseWriter, r *http.Reque
 
 	// Extract the token from the response.
 	log.Debug("reading the response from Keycloak")
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	log.Debug("finished reading the response from Keycloak")
 	if err != nil {
 		err = errors.Wrap(err, "failed to read the response from Keycloak")
@@ -365,7 +365,7 @@ func (c *VICEProxy) HandleAuthorizationCode(w http.ResponseWriter, r *http.Reque
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	log.Debug("access token: %s", tokenResponse.AccessToken)
+	log.Debugf("access token: %s", tokenResponse.AccessToken)
 
 	// Validate the token.
 	token, err := c.ValidateKeycloakToken(tokenResponse.AccessToken)
@@ -389,7 +389,7 @@ func (c *VICEProxy) HandleAuthorizationCode(w http.ResponseWriter, r *http.Reque
 	var s *sessions.Session
 	s, _ = c.sessionStore.Get(r, sessionName)
 	s.Values[sessionKey] = username
-	s.Save(r, w)
+	_ = s.Save(r, w)
 
 	// Redirect the user to the redirect URL, which was determined above.
 	log.Debugf("redirecting the user to: %s", redirectURL.String())
@@ -461,7 +461,7 @@ func (c *VICEProxy) ResetSessionExpiration(w http.ResponseWriter, r *http.Reques
 	}
 
 	session.Values[sessionKey] = msg.(string)
-	session.Save(r, w)
+	_ = session.Save(r, w)
 	return nil
 }
 
@@ -736,7 +736,7 @@ func main() {
 	// Decode the timeout duration for back-channel requests to the identity provider.
 	ssoTimeout, err := time.ParseDuration(*encodedSSOTimeout)
 	if err != nil {
-		log.Fatal("invalid timeout duration for back-channel requests to the IdP: %s", err.Error())
+		log.Fatalf("invalid timeout duration for back-channel requests to the IdP: %s", err.Error())
 	}
 
 	// Create an HTTP client to use for back-channel requests to the identity provider.

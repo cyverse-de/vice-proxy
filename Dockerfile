@@ -1,5 +1,5 @@
 # First stage
-FROM golang:1.15 as build-root
+FROM golang:1.21 as build-root
 
 WORKDIR /build
 
@@ -17,7 +17,7 @@ ENV GOARCH=amd64
 RUN go build ./...
 
 ## Second stage
-FROM golang:1.15
+FROM golang:1.21
 
 COPY --from=build-root /build/vice-proxy /bin/vice-proxy
 

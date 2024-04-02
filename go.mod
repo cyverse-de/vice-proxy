@@ -1,6 +1,6 @@
 module github.com/cyverse-de/vice-proxy
 
-go 1.18
+go 1.21
 
 require (
 	github.com/google/uuid v1.2.0
