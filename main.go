@@ -77,14 +77,14 @@ func (c *VICEProxy) getResourceName(externalID string) (string, error) {
 		return "", err
 	}
 
-	log.Debugf("start of resource name lookup for %s at %s", externalID, c.getAnalysisIDBase)
+	//log.Debugf("start of resource name lookup for %s at %s", externalID, c.getAnalysisIDBase)
 	client := &http.Client{}
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", err
 	}
 	defer resp.Body.Close()
-	log.Debugf("end of resource name lookup for %s at %s", externalID, c.getAnalysisIDBase)
+	//log.Debugf("end of resource name lookup for %s at %s", externalID, c.getAnalysisIDBase)
 
 	analysis := &Analysis{}
 	b, err := io.ReadAll(resp.Body)
@@ -158,14 +158,14 @@ func (c *VICEProxy) IsAllowed(user, resource string) (bool, error) {
 		return false, err
 	}
 
-	log.Debugf("start of permissions lookup for user %s on resource %s at %s", user, resource, c.checkResourceAccessBase)
+	//log.Debugf("start of permissions lookup for user %s on resource %s at %s", user, resource, c.checkResourceAccessBase)
 	client := &http.Client{}
 	resp, err := client.Do(request)
 	if err != nil {
 		return false, err
 	}
 	defer resp.Body.Close()
-	log.Debugf("end of permissions lookup for user %s on resource %s at %s", user, resource, c.checkResourceAccessBase)
+	//log.Debugf("end of permissions lookup for user %s on resource %s at %s", user, resource, c.checkResourceAccessBase)
 
 	b, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -260,7 +260,7 @@ func (c *VICEProxy) HandleAuthorizationCode(w http.ResponseWriter, r *http.Reque
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	log.Debugf("state query parameter value: %s", actualState)
+	//log.Debugf("state query parameter value: %s", actualState)
 	session, err := c.sessionStore.Get(r, stateSessionName)
 	if err != nil {
 		err = errors.New("unable to get the state session")
@@ -275,7 +275,7 @@ func (c *VICEProxy) HandleAuthorizationCode(w http.ResponseWriter, r *http.Reque
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	log.Debugf("expected state value: %s", expectedState)
+	//log.Debugf("expected state value: %s", expectedState)
 	if expectedState != actualState {
 		err = errors.New("expected state ID does not equal actual state ID")
 		log.Error(err)
@@ -285,7 +285,7 @@ func (c *VICEProxy) HandleAuthorizationCode(w http.ResponseWriter, r *http.Reque
 
 	// Extract the authorization code from the request URL.
 	code := r.URL.Query().Get("code")
-	log.Debugf("authorization code: %s", code)
+	//log.Debugf("authorization code: %s", code)
 	if code == "" {
 		err = errors.New("authorization code not found in query string")
 		log.Error(err)
@@ -295,7 +295,7 @@ func (c *VICEProxy) HandleAuthorizationCode(w http.ResponseWriter, r *http.Reque
 
 	// Build the token URL.
 	tokenURL, err := c.KeycloakURL("token")
-	log.Debugf("token URL: %s", tokenURL.String())
+	//log.Debugf("token URL: %s", tokenURL.String())
 	if err != nil {
 		err = errors.Wrap(err, "failed to create the Keycloak token URL")
 		log.Error(err)
@@ -317,7 +317,7 @@ func (c *VICEProxy) HandleAuthorizationCode(w http.ResponseWriter, r *http.Reque
 	params.Del("state")
 	redirectURL.RawQuery = params.Encode()
 	redirectURL.Path = r.URL.Path
-	log.Debugf("redirect URL: %s", redirectURL.String())
+	//log.Debugf("redirect URL: %s", redirectURL.String())
 
 	// Build the form parameters.
 	formParams := url.Values{}
@@ -326,7 +326,7 @@ func (c *VICEProxy) HandleAuthorizationCode(w http.ResponseWriter, r *http.Reque
 	formParams.Set("redirect_uri", redirectURL.String())
 	formParams.Set("client_id", c.keycloakClientID)
 	formParams.Set("client_secret", c.keycloakClientSecret)
-	log.Debugf("form params: %s", formParams.Encode())
+	//log.Debugf("form params: %s", formParams.Encode())
 
 	// Attempt to get the token.
 	log.Debug("attempting to exchange the authorization code for a token")
@@ -365,7 +365,7 @@ func (c *VICEProxy) HandleAuthorizationCode(w http.ResponseWriter, r *http.Reque
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	log.Debugf("access token: %s", tokenResponse.AccessToken)
+	//log.Debugf("access token: %s", tokenResponse.AccessToken)
 
 	// Validate the token.
 	token, err := c.ValidateKeycloakToken(tokenResponse.AccessToken)
@@ -392,7 +392,7 @@ func (c *VICEProxy) HandleAuthorizationCode(w http.ResponseWriter, r *http.Reque
 	_ = s.Save(r, w)
 
 	// Redirect the user to the redirect URL, which was determined above.
-	log.Debugf("redirecting the user to: %s", redirectURL.String())
+	//log.Debugf("redirecting the user to: %s", redirectURL.String())
 	http.Redirect(w, r, redirectURL.String(), http.StatusTemporaryRedirect)
 }
 
@@ -415,7 +415,7 @@ func (c *VICEProxy) RequireKeycloakAuth(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	log.Debugf("generated state ID: %s", stateID.String())
+	//log.Debugf("generated state ID: %s", stateID.String())
 
 	// Build the redirect URL.
 	redirectURL, err := url.Parse(c.frontendURL)
@@ -426,7 +426,7 @@ func (c *VICEProxy) RequireKeycloakAuth(w http.ResponseWriter, r *http.Request) 
 	}
 	redirectURL.Path = r.URL.Path
 	redirectURL.RawQuery = r.URL.RawQuery
-	log.Debugf("redirect URL: %s", redirectURL.String())
+	//log.Debugf("redirect URL: %s", redirectURL.String())
 
 	// Build the login URL and set the query parameters.
 	loginURL, err := c.KeycloakURL("auth")
@@ -444,7 +444,7 @@ func (c *VICEProxy) RequireKeycloakAuth(w http.ResponseWriter, r *http.Request) 
 	loginURL.RawQuery = params.Encode()
 
 	// Redirect the user to the login URL.
-	log.Debugf("redirecting the user to %s", loginURL.String())
+	//log.Debugf("redirecting the user to %s", loginURL.String())
 	http.Redirect(w, r, loginURL.String(), http.StatusTemporaryRedirect)
 }
 
@@ -590,7 +590,7 @@ func (c *VICEProxy) Proxy() (http.Handler, error) {
 	}
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		log.Debugf("handling request for %s from remote address %s", r.URL.String(), r.RemoteAddr)
+		//log.Debugf("handling request for %s from remote address %s", r.URL.String(), r.RemoteAddr)
 
 		//Get the username from the cookie
 		session, err := c.sessionStore.Get(r, sessionName)
