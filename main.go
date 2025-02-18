@@ -77,14 +77,14 @@ func (c *VICEProxy) getResourceName(externalID string) (string, error) {
 		return "", err
 	}
 
-	log.Warnf("start of resource name lookup for %s at %s", externalID, c.getAnalysisIDBase)
+	log.Debugf("start of resource name lookup for %s at %s", externalID, c.getAnalysisIDBase)
 	client := &http.Client{}
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", err
 	}
 	defer resp.Body.Close()
-	log.Warnf("end of resource name lookup for %s at %s", externalID, c.getAnalysisIDBase)
+	log.Debugf("end of resource name lookup for %s at %s", externalID, c.getAnalysisIDBase)
 
 	analysis := &Analysis{}
 	b, err := io.ReadAll(resp.Body)
@@ -158,14 +158,14 @@ func (c *VICEProxy) IsAllowed(user, resource string) (bool, error) {
 		return false, err
 	}
 
-	log.Warnf("start of permissions lookup for user %s on resource %s at %s", user, resource, c.checkResourceAccessBase)
+	log.Debugf("start of permissions lookup for user %s on resource %s at %s", user, resource, c.checkResourceAccessBase)
 	client := &http.Client{}
 	resp, err := client.Do(request)
 	if err != nil {
 		return false, err
 	}
 	defer resp.Body.Close()
-	log.Warnf("end of permissions lookup for user %s on resource %s at %s", user, resource, c.checkResourceAccessBase)
+	log.Debugf("end of permissions lookup for user %s on resource %s at %s", user, resource, c.checkResourceAccessBase)
 
 	b, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -398,7 +398,7 @@ func (c *VICEProxy) HandleAuthorizationCode(w http.ResponseWriter, r *http.Reque
 
 // RequireKeycloakAuth ensures that the user is logged in via Keycloak.
 func (c *VICEProxy) RequireKeycloakAuth(w http.ResponseWriter, r *http.Request) {
-	log.Info("redirecting user to Keycloak for authentication")
+	log.Debug("redirecting user to Keycloak for authentication")
 
 	// Generate a UUID for a state ID so that we can validate it later.
 	stateID, err := uuid.NewUUID()
@@ -479,7 +479,7 @@ func (c *VICEProxy) Session(r *http.Request, m *mux.RouteMatch) bool {
 	}
 	msg := msgraw.(string)
 	if msg == "" {
-		log.Infof("session value was empty instead of a username")
+		log.Debug("session value was empty instead of a username")
 		return true
 	}
 
@@ -590,7 +590,7 @@ func (c *VICEProxy) Proxy() (http.Handler, error) {
 	}
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		log.Warnf("handling request for %s from remote address %s", r.URL.String(), r.RemoteAddr)
+		log.Debugf("handling request for %s from remote address %s", r.URL.String(), r.RemoteAddr)
 
 		//Get the username from the cookie
 		session, err := c.sessionStore.Get(r, sessionName)
@@ -650,7 +650,7 @@ func (o *originFlags) Set(s string) error {
 
 func main() {
 	logrus.SetReportCaller(true)
-	logrus.SetLevel(logrus.DebugLevel)
+	logrus.SetLevel(logrus.InfoLevel)
 
 	var (
 		corsOrigins             originFlags
