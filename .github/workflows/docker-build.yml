@@ -8,7 +8,7 @@ on:
 
 jobs:
   call-workflow-passing-data:
-    uses: cyverse-de/github-workflows/.github/workflows/docker-build.yml@v0.1.4
+    uses: cyverse-de/github-workflows/.github/workflows/docker-build.yml@v0.1.9
     with:
       build-prerelease: ${{ contains(github.ref_name, '-rc') }}
     secrets:
