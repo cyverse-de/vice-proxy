@@ -16,12 +16,12 @@ import (
 	"github.com/google/uuid"
 	"github.com/gorilla/mux"
 	"github.com/gorilla/sessions"
+	"github.com/gorilla/websocket"
 	"github.com/lestrrat-go/jwx/jwk"
 	"github.com/lestrrat-go/jwx/jwt"
 	"github.com/pkg/errors"
 	"github.com/rs/cors"
 	"github.com/sirupsen/logrus"
-	"github.com/yhat/wsutil"
 )
 
 var log = logrus.WithFields(logrus.Fields{
@@ -496,14 +496,97 @@ func (c *VICEProxy) ReverseProxy() (*httputil.ReverseProxy, error) {
 	return httputil.NewSingleHostReverseProxy(backend), nil
 }
 
-// WSReverseProxy returns a proxy that forwards websocket request to the
-// configured backend URL. It can act as a http.Handler.
-func (c *VICEProxy) WSReverseProxy() (*wsutil.ReverseProxy, error) {
-	w, err := url.Parse(c.wsbackendURL)
+// wsUpgrader configures the WebSocket upgrader for client connections.
+var wsUpgrader = websocket.Upgrader{
+	ReadBufferSize:  1024,
+	WriteBufferSize: 1024,
+	CheckOrigin: func(r *http.Request) bool {
+		// Origin checking is handled by CORS middleware
+		return true
+	},
+}
+
+// proxyWebSocket handles WebSocket proxying using gorilla/websocket.
+func (c *VICEProxy) proxyWebSocket(w http.ResponseWriter, r *http.Request) error {
+	// Parse the backend WebSocket URL
+	backendURL, err := url.Parse(c.wsbackendURL)
 	if err != nil {
-		return nil, errors.Wrapf(err, "failed to parse the websocket backend URL %s", c.wsbackendURL)
+		return errors.Wrapf(err, "failed to parse the websocket backend URL %s", c.wsbackendURL)
 	}
-	return wsutil.NewSingleHostReverseProxy(w), nil
+
+	// Build the full backend URL with the request path and query
+	backendURL.Path = r.URL.Path
+	backendURL.RawQuery = r.URL.RawQuery
+
+	// Upgrade the client connection
+	clientConn, err := wsUpgrader.Upgrade(w, r, nil)
+	if err != nil {
+		return errors.Wrap(err, "failed to upgrade client connection")
+	}
+	defer clientConn.Close()
+
+	// Connect to the backend
+	backendConn, _, err := websocket.DefaultDialer.Dial(backendURL.String(), nil)
+	if err != nil {
+		return errors.Wrap(err, "failed to connect to backend websocket")
+	}
+	defer backendConn.Close()
+
+	// Create error channel for bidirectional copy
+	errClient := make(chan error, 1)
+	errBackend := make(chan error, 1)
+
+	// Copy from client to backend
+	go func() {
+		defer backendConn.Close()
+		for {
+			messageType, message, err := clientConn.ReadMessage()
+			if err != nil {
+				errClient <- err
+				return
+			}
+			if err := backendConn.WriteMessage(messageType, message); err != nil {
+				errClient <- err
+				return
+			}
+		}
+	}()
+
+	// Copy from backend to client
+	go func() {
+		defer clientConn.Close()
+		for {
+			messageType, message, err := backendConn.ReadMessage()
+			if err != nil {
+				errBackend <- err
+				return
+			}
+			if err := clientConn.WriteMessage(messageType, message); err != nil {
+				errBackend <- err
+				return
+			}
+		}
+	}()
+
+	// Wait for either direction to close
+	select {
+	case err = <-errClient:
+		if err != nil && !websocket.IsCloseError(err,
+			websocket.CloseNormalClosure,
+			websocket.CloseGoingAway,
+			websocket.CloseNoStatusReceived) {
+			return errors.Wrap(err, "client connection error")
+		}
+	case err = <-errBackend:
+		if err != nil && !websocket.IsCloseError(err,
+			websocket.CloseNormalClosure,
+			websocket.CloseGoingAway,
+			websocket.CloseNoStatusReceived) {
+			return errors.Wrap(err, "backend connection error")
+		}
+	}
+
+	return nil
 }
 
 // isWebsocket returns true if the connection is a websocket request. Adapted
@@ -540,10 +623,13 @@ func (c *VICEProxy) backendIsReady(backendURL string) (bool, error) {
 // {"ready":boolean}, telling whether or not the underlying application is ready
 // for business yet.
 func (c *VICEProxy) URLIsReady(w http.ResponseWriter, r *http.Request) {
+	log.Infof("checking backend readiness at %s", c.backendURL)
 	ready, err := c.backendIsReady(c.backendURL)
 	if err != nil {
-		log.Error(err)
+		log.Errorf("backend readiness check failed: %v", err)
 	}
+
+	log.Infof("backend ready status: %v", ready)
 
 	data := map[string]bool{
 		"ready": ready,
@@ -551,6 +637,7 @@ func (c *VICEProxy) URLIsReady(w http.ResponseWriter, r *http.Request) {
 
 	body, err := json.Marshal(data)
 	if err != nil {
+		log.Errorf("failed to marshal readiness response: %v", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -574,11 +661,6 @@ func (c *VICEProxy) GetFrontendHost() (string, error) {
 
 // Proxy returns a handler that can support both websockets and http requests.
 func (c *VICEProxy) Proxy() (http.Handler, error) {
-	ws, err := c.WSReverseProxy()
-	if err != nil {
-		return nil, err
-	}
-
 	rp, err := c.ReverseProxy()
 	if err != nil {
 		return nil, err
@@ -590,12 +672,13 @@ func (c *VICEProxy) Proxy() (http.Handler, error) {
 	}
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		//log.Debugf("handling request for %s from remote address %s", r.URL.String(), r.RemoteAddr)
+		log.Infof("handling request for %s from remote address %s", r.URL.String(), r.RemoteAddr)
 
 		//Get the username from the cookie
 		session, err := c.sessionStore.Get(r, sessionName)
 		if err != nil {
 			err = errors.Wrap(err, "failed to get session")
+			log.Errorf("session error: %v", err)
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -603,9 +686,11 @@ func (c *VICEProxy) Proxy() (http.Handler, error) {
 		username := session.Values[sessionKey].(string)
 		if username == "" {
 			err = errors.Wrap(err, "username was empty")
+			log.Errorf("authentication error: %v", err)
 			http.Error(w, err.Error(), http.StatusForbidden)
 			return
 		}
+		log.Infof("authenticated user: %s", username)
 
 		// Check to make sure the user can access the resource.
 		allowed, err := c.IsAllowed(username, c.resourceName)
@@ -615,23 +700,34 @@ func (c *VICEProxy) Proxy() (http.Handler, error) {
 			} else {
 				err = errors.New("access denied")
 			}
+			log.Errorf("authorization error for user %s: %v", username, err)
 			http.Error(w, err.Error(), http.StatusForbidden)
 			return
 		}
+		log.Infof("user %s authorized for resource %s", username, c.resourceName)
 
 		// Override the X-Forwarded-Host header.
 		r.Header.Set("X-Forwarded-Host", frontendHost)
 
+		// CRITICAL FIX: Handle WebSocket requests BEFORE calling ResetSessionExpiration
+		// to avoid writing session cookies during the WebSocket upgrade handshake.
+		if c.isWebsocket(r) {
+			log.Infof("proxying websocket request to %s", c.wsbackendURL)
+			if err := c.proxyWebSocket(w, r); err != nil {
+				log.Errorf("websocket proxy error: %v", err)
+			}
+			return
+		}
+
+		// Only reset session expiration for regular HTTP requests
 		if err = c.ResetSessionExpiration(w, r); err != nil {
 			err = errors.Wrap(err, "error resetting session expiration")
+			log.Errorf("session expiration error: %v", err)
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 
-		if c.isWebsocket(r) {
-			ws.ServeHTTP(w, r)
-			return
-		}
+		log.Infof("proxying HTTP request to %s%s", c.backendURL, r.URL.Path)
 		rp.ServeHTTP(w, r)
 	}), nil
 }
@@ -694,14 +790,20 @@ func main() {
 		corsOrigins = originFlags{"*.cyverse.run", "*.cyverse.org", "*.cyverse.run:4343", "cyverse.run", "cyverse.run:4343"}
 	}
 
-	if *wsbackendURL == "" {
-		w, err := url.Parse(*backendURL)
-		if err != nil {
-			log.Fatal(err)
-		}
-		w.Scheme = "ws"
-		*wsbackendURL = w.String()
+	w, err := url.Parse(*backendURL)
+	if err != nil {
+		log.Fatal(err)
 	}
+	// Map HTTP/HTTPS schemes to their WebSocket equivalents
+	switch w.Scheme {
+	case "https":
+		w.Scheme = "wss"
+	case "http":
+		w.Scheme = "ws"
+	default:
+		log.Fatalf("unsupported backend URL scheme: %s (expected http or https)", w.Scheme)
+	}
+	*wsbackendURL = w.String()
 
 	if *externalID == "" {
 		log.Fatal("--external-id must be set.")
@@ -721,7 +823,7 @@ func main() {
 	}
 
 	authkey := make([]byte, 64)
-	_, err := rand.Read(authkey)
+	_, err = rand.Read(authkey)
 	if err != nil {
 		log.Fatal(err)
 	}
