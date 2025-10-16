@@ -16,7 +16,6 @@ import (
 	"github.com/google/uuid"
 	"github.com/gorilla/mux"
 	"github.com/gorilla/sessions"
-	"github.com/gorilla/websocket"
 	"github.com/lestrrat-go/jwx/jwk"
 	"github.com/lestrrat-go/jwx/jwt"
 	"github.com/pkg/errors"
@@ -487,106 +486,27 @@ func (c *VICEProxy) Session(r *http.Request, m *mux.RouteMatch) bool {
 }
 
 // ReverseProxy returns a proxy that forwards requests to the configured
-// backend URL. It can act as a http.Handler.
+// backend URL. It can act as a http.Handler and properly handles WebSocket upgrades.
 func (c *VICEProxy) ReverseProxy() (*httputil.ReverseProxy, error) {
 	backend, err := url.Parse(c.backendURL)
 	if err != nil {
 		return nil, errors.Wrapf(err, "failed to parse %s", c.backendURL)
 	}
-	return httputil.NewSingleHostReverseProxy(backend), nil
-}
 
-// wsUpgrader configures the WebSocket upgrader for client connections.
-var wsUpgrader = websocket.Upgrader{
-	ReadBufferSize:  1024,
-	WriteBufferSize: 1024,
-	CheckOrigin: func(r *http.Request) bool {
-		// Origin checking is handled by CORS middleware
-		return true
-	},
-}
+	proxy := httputil.NewSingleHostReverseProxy(backend)
 
-// proxyWebSocket handles WebSocket proxying using gorilla/websocket.
-func (c *VICEProxy) proxyWebSocket(w http.ResponseWriter, r *http.Request) error {
-	// Parse the backend WebSocket URL
-	backendURL, err := url.Parse(c.wsbackendURL)
-	if err != nil {
-		return errors.Wrapf(err, "failed to parse the websocket backend URL %s", c.wsbackendURL)
-	}
-
-	// Build the full backend URL with the request path and query
-	backendURL.Path = r.URL.Path
-	backendURL.RawQuery = r.URL.RawQuery
-
-	// Upgrade the client connection
-	clientConn, err := wsUpgrader.Upgrade(w, r, nil)
-	if err != nil {
-		return errors.Wrap(err, "failed to upgrade client connection")
-	}
-	defer clientConn.Close()
-
-	// Connect to the backend
-	backendConn, _, err := websocket.DefaultDialer.Dial(backendURL.String(), nil)
-	if err != nil {
-		return errors.Wrap(err, "failed to connect to backend websocket")
-	}
-	defer backendConn.Close()
-
-	// Create error channel for bidirectional copy
-	errClient := make(chan error, 1)
-	errBackend := make(chan error, 1)
-
-	// Copy from client to backend
-	go func() {
-		defer backendConn.Close()
-		for {
-			messageType, message, err := clientConn.ReadMessage()
-			if err != nil {
-				errClient <- err
-				return
-			}
-			if err := backendConn.WriteMessage(messageType, message); err != nil {
-				errClient <- err
-				return
-			}
-		}
-	}()
-
-	// Copy from backend to client
-	go func() {
-		defer clientConn.Close()
-		for {
-			messageType, message, err := backendConn.ReadMessage()
-			if err != nil {
-				errBackend <- err
-				return
-			}
-			if err := clientConn.WriteMessage(messageType, message); err != nil {
-				errBackend <- err
-				return
-			}
-		}
-	}()
-
-	// Wait for either direction to close
-	select {
-	case err = <-errClient:
-		if err != nil && !websocket.IsCloseError(err,
-			websocket.CloseNormalClosure,
-			websocket.CloseGoingAway,
-			websocket.CloseNoStatusReceived) {
-			return errors.Wrap(err, "client connection error")
-		}
-	case err = <-errBackend:
-		if err != nil && !websocket.IsCloseError(err,
-			websocket.CloseNormalClosure,
-			websocket.CloseGoingAway,
-			websocket.CloseNoStatusReceived) {
-			return errors.Wrap(err, "backend connection error")
+	// Customize the director to handle WebSocket upgrade properly
+	originalDirector := proxy.Director
+	proxy.Director = func(req *http.Request) {
+		originalDirector(req)
+		// For WebSocket requests, ensure proper scheme in target URL
+		if c.isWebsocket(req) {
+			// The backend URL stays http:// but the proxy will handle upgrade
+			log.Infof("WebSocket upgrade request detected for %s", req.URL.Path)
 		}
 	}
 
-	return nil
+	return proxy, nil
 }
 
 // isWebsocket returns true if the connection is a websocket request. Adapted
@@ -709,25 +629,18 @@ func (c *VICEProxy) Proxy() (http.Handler, error) {
 		// Override the X-Forwarded-Host header.
 		r.Header.Set("X-Forwarded-Host", frontendHost)
 
-		// CRITICAL FIX: Handle WebSocket requests BEFORE calling ResetSessionExpiration
-		// to avoid writing session cookies during the WebSocket upgrade handshake.
-		if c.isWebsocket(r) {
-			log.Infof("proxying websocket request to %s", c.wsbackendURL)
-			if err := c.proxyWebSocket(w, r); err != nil {
-				log.Errorf("websocket proxy error: %v", err)
+		// CRITICAL: Don't reset session for WebSocket upgrades (would corrupt the upgrade handshake)
+		if !c.isWebsocket(r) {
+			if err = c.ResetSessionExpiration(w, r); err != nil {
+				err = errors.Wrap(err, "error resetting session expiration")
+				log.Errorf("session expiration error: %v", err)
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
 			}
-			return
 		}
 
-		// Only reset session expiration for regular HTTP requests
-		if err = c.ResetSessionExpiration(w, r); err != nil {
-			err = errors.Wrap(err, "error resetting session expiration")
-			log.Errorf("session expiration error: %v", err)
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		log.Infof("proxying HTTP request to %s%s", c.backendURL, r.URL.Path)
+		// The reverse proxy handles both HTTP and WebSocket upgrade requests transparently
+		log.Infof("proxying request to %s%s", c.backendURL, r.URL.Path)
 		rp.ServeHTTP(w, r)
 	}), nil
 }
@@ -790,21 +703,6 @@ func main() {
 		corsOrigins = originFlags{"*.cyverse.run", "*.cyverse.org", "*.cyverse.run:4343", "cyverse.run", "cyverse.run:4343"}
 	}
 
-	w, err := url.Parse(*backendURL)
-	if err != nil {
-		log.Fatal(err)
-	}
-	// Map HTTP/HTTPS schemes to their WebSocket equivalents
-	switch w.Scheme {
-	case "https":
-		w.Scheme = "wss"
-	case "http":
-		w.Scheme = "ws"
-	default:
-		log.Fatalf("unsupported backend URL scheme: %s (expected http or https)", w.Scheme)
-	}
-	*wsbackendURL = w.String()
-
 	if *externalID == "" {
 		log.Fatal("--external-id must be set.")
 	}
@@ -823,7 +721,7 @@ func main() {
 	}
 
 	authkey := make([]byte, 64)
-	_, err = rand.Read(authkey)
+	_, err := rand.Read(authkey)
 	if err != nil {
 		log.Fatal(err)
 	}
