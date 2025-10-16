@@ -21,7 +21,6 @@ import (
 	"github.com/pkg/errors"
 	"github.com/rs/cors"
 	"github.com/sirupsen/logrus"
-	"github.com/yhat/wsutil"
 )
 
 var log = logrus.WithFields(logrus.Fields{
@@ -487,23 +486,27 @@ func (c *VICEProxy) Session(r *http.Request, m *mux.RouteMatch) bool {
 }
 
 // ReverseProxy returns a proxy that forwards requests to the configured
-// backend URL. It can act as a http.Handler.
+// backend URL. It can act as a http.Handler and properly handles WebSocket upgrades.
 func (c *VICEProxy) ReverseProxy() (*httputil.ReverseProxy, error) {
 	backend, err := url.Parse(c.backendURL)
 	if err != nil {
 		return nil, errors.Wrapf(err, "failed to parse %s", c.backendURL)
 	}
-	return httputil.NewSingleHostReverseProxy(backend), nil
-}
 
-// WSReverseProxy returns a proxy that forwards websocket request to the
-// configured backend URL. It can act as a http.Handler.
-func (c *VICEProxy) WSReverseProxy() (*wsutil.ReverseProxy, error) {
-	w, err := url.Parse(c.wsbackendURL)
-	if err != nil {
-		return nil, errors.Wrapf(err, "failed to parse the websocket backend URL %s", c.wsbackendURL)
+	proxy := httputil.NewSingleHostReverseProxy(backend)
+
+	// Customize the director to handle WebSocket upgrade properly
+	originalDirector := proxy.Director
+	proxy.Director = func(req *http.Request) {
+		originalDirector(req)
+		// For WebSocket requests, ensure proper scheme in target URL
+		if c.isWebsocket(req) {
+			// The backend URL stays http:// but the proxy will handle upgrade
+			log.Infof("WebSocket upgrade request detected for %s", req.URL.Path)
+		}
 	}
-	return wsutil.NewSingleHostReverseProxy(w), nil
+
+	return proxy, nil
 }
 
 // isWebsocket returns true if the connection is a websocket request. Adapted
@@ -540,10 +543,13 @@ func (c *VICEProxy) backendIsReady(backendURL string) (bool, error) {
 // {"ready":boolean}, telling whether or not the underlying application is ready
 // for business yet.
 func (c *VICEProxy) URLIsReady(w http.ResponseWriter, r *http.Request) {
+	log.Infof("checking backend readiness at %s", c.backendURL)
 	ready, err := c.backendIsReady(c.backendURL)
 	if err != nil {
-		log.Error(err)
+		log.Errorf("backend readiness check failed: %v", err)
 	}
+
+	log.Infof("backend ready status: %v", ready)
 
 	data := map[string]bool{
 		"ready": ready,
@@ -551,6 +557,7 @@ func (c *VICEProxy) URLIsReady(w http.ResponseWriter, r *http.Request) {
 
 	body, err := json.Marshal(data)
 	if err != nil {
+		log.Errorf("failed to marshal readiness response: %v", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -574,11 +581,6 @@ func (c *VICEProxy) GetFrontendHost() (string, error) {
 
 // Proxy returns a handler that can support both websockets and http requests.
 func (c *VICEProxy) Proxy() (http.Handler, error) {
-	ws, err := c.WSReverseProxy()
-	if err != nil {
-		return nil, err
-	}
-
 	rp, err := c.ReverseProxy()
 	if err != nil {
 		return nil, err
@@ -590,12 +592,13 @@ func (c *VICEProxy) Proxy() (http.Handler, error) {
 	}
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		//log.Debugf("handling request for %s from remote address %s", r.URL.String(), r.RemoteAddr)
+		log.Infof("handling request for %s from remote address %s", r.URL.String(), r.RemoteAddr)
 
 		//Get the username from the cookie
 		session, err := c.sessionStore.Get(r, sessionName)
 		if err != nil {
 			err = errors.Wrap(err, "failed to get session")
+			log.Errorf("session error: %v", err)
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -603,9 +606,11 @@ func (c *VICEProxy) Proxy() (http.Handler, error) {
 		username := session.Values[sessionKey].(string)
 		if username == "" {
 			err = errors.Wrap(err, "username was empty")
+			log.Errorf("authentication error: %v", err)
 			http.Error(w, err.Error(), http.StatusForbidden)
 			return
 		}
+		log.Infof("authenticated user: %s", username)
 
 		// Check to make sure the user can access the resource.
 		allowed, err := c.IsAllowed(username, c.resourceName)
@@ -615,23 +620,27 @@ func (c *VICEProxy) Proxy() (http.Handler, error) {
 			} else {
 				err = errors.New("access denied")
 			}
+			log.Errorf("authorization error for user %s: %v", username, err)
 			http.Error(w, err.Error(), http.StatusForbidden)
 			return
 		}
+		log.Infof("user %s authorized for resource %s", username, c.resourceName)
 
 		// Override the X-Forwarded-Host header.
 		r.Header.Set("X-Forwarded-Host", frontendHost)
 
-		if err = c.ResetSessionExpiration(w, r); err != nil {
-			err = errors.Wrap(err, "error resetting session expiration")
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
+		// CRITICAL: Don't reset session for WebSocket upgrades (would corrupt the upgrade handshake)
+		if !c.isWebsocket(r) {
+			if err = c.ResetSessionExpiration(w, r); err != nil {
+				err = errors.Wrap(err, "error resetting session expiration")
+				log.Errorf("session expiration error: %v", err)
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
 		}
 
-		if c.isWebsocket(r) {
-			ws.ServeHTTP(w, r)
-			return
-		}
+		// The reverse proxy handles both HTTP and WebSocket upgrade requests transparently
+		log.Infof("proxying request to %s%s", c.backendURL, r.URL.Path)
 		rp.ServeHTTP(w, r)
 	}), nil
 }
@@ -669,6 +678,9 @@ func main() {
 		checkResourceAccessBase = flag.String("check-resource-access-base", "http://check-resource-access", "The base URL for the check-resource-access service.")
 		externalID              = flag.String("external-id", "", "The external ID to pass to the apps service when looking up the analysis ID.")
 		encodedSSOTimeout       = flag.String("sso-timeout", "5s", "The timeout period for back-channel requests to the identity provider.")
+		encodedReadTimeout      = flag.String("read-timeout", "48h", "The maximum duration for reading the entire request, including the body.")
+		encodedWriteTimeout     = flag.String("write-timeout", "48h", "The maximum duration before timing out writes of the response.")
+		encodedIdleTimeout      = flag.String("idle-timeout", "5000s", "The maximum amount of time to wait for the next request when keep-alives are enabled.")
 	)
 
 	flag.Var(&corsOrigins, "allowed-origins", "List of allowed origins, separated by commas.")
@@ -694,15 +706,6 @@ func main() {
 		corsOrigins = originFlags{"*.cyverse.run", "*.cyverse.org", "*.cyverse.run:4343", "cyverse.run", "cyverse.run:4343"}
 	}
 
-	if *wsbackendURL == "" {
-		w, err := url.Parse(*backendURL)
-		if err != nil {
-			log.Fatal(err)
-		}
-		w.Scheme = "ws"
-		*wsbackendURL = w.String()
-	}
-
 	if *externalID == "" {
 		log.Fatal("--external-id must be set.")
 	}
@@ -715,6 +718,9 @@ func main() {
 	log.Infof("Keycloak realm is %s", *keycloakRealm)
 	log.Infof("Keycloak client ID is %s", *keycloakClientID)
 	log.Infof("Keycloak client secret is %s", *keycloakClientSecret)
+	log.Infof("read timeout is %s", *encodedReadTimeout)
+	log.Infof("write timeout is %s", *encodedWriteTimeout)
+	log.Infof("idle timeout is %s", *encodedIdleTimeout)
 
 	for _, c := range corsOrigins {
 		log.Infof("Origin: %s\n", c)
@@ -737,6 +743,22 @@ func main() {
 	ssoTimeout, err := time.ParseDuration(*encodedSSOTimeout)
 	if err != nil {
 		log.Fatalf("invalid timeout duration for back-channel requests to the IdP: %s", err.Error())
+	}
+
+	// Decode the timeout durations for the HTTP server.
+	readTimeout, err := time.ParseDuration(*encodedReadTimeout)
+	if err != nil {
+		log.Fatalf("invalid read timeout duration: %s", err.Error())
+	}
+
+	writeTimeout, err := time.ParseDuration(*encodedWriteTimeout)
+	if err != nil {
+		log.Fatalf("invalid write timeout duration: %s", err.Error())
+	}
+
+	idleTimeout, err := time.ParseDuration(*encodedIdleTimeout)
+	if err != nil {
+		log.Fatalf("invalid idle timeout duration: %s", err.Error())
 	}
 
 	// Create an HTTP client to use for back-channel requests to the identity provider.
@@ -784,8 +806,11 @@ func main() {
 	})
 
 	server := &http.Server{
-		Handler: c.Handler(r),
-		Addr:    *listenAddr,
+		Handler:      c.Handler(r),
+		Addr:         *listenAddr,
+		ReadTimeout:  readTimeout,
+		WriteTimeout: writeTimeout,
+		IdleTimeout:  idleTimeout,
 	}
 	if useSSL {
 		err = server.ListenAndServeTLS(*sslCert, *sslKey)

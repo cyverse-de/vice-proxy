@@ -11,7 +11,6 @@ require (
 	github.com/rs/cors v1.11.1
 	github.com/sirupsen/logrus v1.9.3
 	github.com/stretchr/testify v1.9.0
-	github.com/yhat/wsutil v0.0.0-20170731153501-1d66fa95c997
 )
 
 require (
