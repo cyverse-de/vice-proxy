@@ -678,6 +678,9 @@ func main() {
 		checkResourceAccessBase = flag.String("check-resource-access-base", "http://check-resource-access", "The base URL for the check-resource-access service.")
 		externalID              = flag.String("external-id", "", "The external ID to pass to the apps service when looking up the analysis ID.")
 		encodedSSOTimeout       = flag.String("sso-timeout", "5s", "The timeout period for back-channel requests to the identity provider.")
+		encodedReadTimeout      = flag.String("read-timeout", "48h", "The maximum duration for reading the entire request, including the body.")
+		encodedWriteTimeout     = flag.String("write-timeout", "48h", "The maximum duration before timing out writes of the response.")
+		encodedIdleTimeout      = flag.String("idle-timeout", "5000s", "The maximum amount of time to wait for the next request when keep-alives are enabled.")
 	)
 
 	flag.Var(&corsOrigins, "allowed-origins", "List of allowed origins, separated by commas.")
@@ -715,6 +718,9 @@ func main() {
 	log.Infof("Keycloak realm is %s", *keycloakRealm)
 	log.Infof("Keycloak client ID is %s", *keycloakClientID)
 	log.Infof("Keycloak client secret is %s", *keycloakClientSecret)
+	log.Infof("read timeout is %s", *encodedReadTimeout)
+	log.Infof("write timeout is %s", *encodedWriteTimeout)
+	log.Infof("idle timeout is %s", *encodedIdleTimeout)
 
 	for _, c := range corsOrigins {
 		log.Infof("Origin: %s\n", c)
@@ -737,6 +743,22 @@ func main() {
 	ssoTimeout, err := time.ParseDuration(*encodedSSOTimeout)
 	if err != nil {
 		log.Fatalf("invalid timeout duration for back-channel requests to the IdP: %s", err.Error())
+	}
+
+	// Decode the timeout durations for the HTTP server.
+	readTimeout, err := time.ParseDuration(*encodedReadTimeout)
+	if err != nil {
+		log.Fatalf("invalid read timeout duration: %s", err.Error())
+	}
+
+	writeTimeout, err := time.ParseDuration(*encodedWriteTimeout)
+	if err != nil {
+		log.Fatalf("invalid write timeout duration: %s", err.Error())
+	}
+
+	idleTimeout, err := time.ParseDuration(*encodedIdleTimeout)
+	if err != nil {
+		log.Fatalf("invalid idle timeout duration: %s", err.Error())
 	}
 
 	// Create an HTTP client to use for back-channel requests to the identity provider.
@@ -784,8 +806,11 @@ func main() {
 	})
 
 	server := &http.Server{
-		Handler: c.Handler(r),
-		Addr:    *listenAddr,
+		Handler:      c.Handler(r),
+		Addr:         *listenAddr,
+		ReadTimeout:  readTimeout,
+		WriteTimeout: writeTimeout,
+		IdleTimeout:  idleTimeout,
 	}
 	if useSSL {
 		err = server.ListenAndServeTLS(*sslCert, *sslKey)
