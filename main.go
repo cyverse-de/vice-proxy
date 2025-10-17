@@ -49,6 +49,7 @@ type VICEProxy struct {
 	checkResourceAccessBase string                // The base URL for the check-resource-access service.
 	sessionStore            *sessions.CookieStore // The backend session storage.
 	ssoClient               http.Client           // The HTTP client for back-channel requests to the IDP.
+	disableAuth             bool                  // If true, authentication and authorization are disabled.
 }
 
 // Analysis contains the ID for the Analysis, which gets used as the resource
@@ -579,6 +580,47 @@ func (c *VICEProxy) GetFrontendHost() (string, error) {
 	return svcURL.Host, nil
 }
 
+// authenticateAndAuthorize validates the user's session and checks if they have permission
+// to access the resource. Returns the username on success, or an error on failure.
+func (c *VICEProxy) authenticateAndAuthorize(w http.ResponseWriter, r *http.Request) (string, error) {
+	// Get the username from the cookie
+	session, err := c.sessionStore.Get(r, sessionName)
+	if err != nil {
+		return "", errors.Wrap(err, "failed to get session")
+	}
+
+	// Check if the session contains a username
+	usernameValue, ok := session.Values[sessionKey]
+	if !ok || usernameValue == nil {
+		return "", errors.New("no session found")
+	}
+
+	username, ok := usernameValue.(string)
+	if !ok || username == "" {
+		return "", errors.New("username was empty or invalid")
+	}
+	log.Infof("authenticated user: %s", username)
+
+	// Check to make sure the user can access the resource.
+	allowed, err := c.IsAllowed(username, c.resourceName)
+	if !allowed || err != nil {
+		if err != nil {
+			return "", errors.Wrap(err, "access denied")
+		}
+		return "", errors.New("access denied")
+	}
+	log.Infof("user %s authorized for resource %s", username, c.resourceName)
+
+	// CRITICAL: Don't reset session for WebSocket upgrades (would corrupt the upgrade handshake)
+	if !c.isWebsocket(r) {
+		if err = c.ResetSessionExpiration(w, r); err != nil {
+			return "", errors.Wrap(err, "error resetting session expiration")
+		}
+	}
+
+	return username, nil
+}
+
 // Proxy returns a handler that can support both websockets and http requests.
 func (c *VICEProxy) Proxy() (http.Handler, error) {
 	rp, err := c.ReverseProxy()
@@ -594,50 +636,21 @@ func (c *VICEProxy) Proxy() (http.Handler, error) {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		log.Infof("handling request for %s from remote address %s", r.URL.String(), r.RemoteAddr)
 
-		//Get the username from the cookie
-		session, err := c.sessionStore.Get(r, sessionName)
-		if err != nil {
-			err = errors.Wrap(err, "failed to get session")
-			log.Errorf("session error: %v", err)
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		username := session.Values[sessionKey].(string)
-		if username == "" {
-			err = errors.Wrap(err, "username was empty")
-			log.Errorf("authentication error: %v", err)
-			http.Error(w, err.Error(), http.StatusForbidden)
-			return
-		}
-		log.Infof("authenticated user: %s", username)
-
-		// Check to make sure the user can access the resource.
-		allowed, err := c.IsAllowed(username, c.resourceName)
-		if !allowed || err != nil {
+		// Conditionally perform authentication and authorization
+		if !c.disableAuth {
+			username, err := c.authenticateAndAuthorize(w, r)
 			if err != nil {
-				err = errors.Wrap(err, "access denied")
-			} else {
-				err = errors.New("access denied")
+				log.Errorf("auth/authz error: %v", err)
+				http.Error(w, err.Error(), http.StatusForbidden)
+				return
 			}
-			log.Errorf("authorization error for user %s: %v", username, err)
-			http.Error(w, err.Error(), http.StatusForbidden)
-			return
+			log.Debugf("request authorized for user: %s", username)
+		} else {
+			log.Debug("authentication disabled, allowing unauthenticated access")
 		}
-		log.Infof("user %s authorized for resource %s", username, c.resourceName)
 
 		// Override the X-Forwarded-Host header.
 		r.Header.Set("X-Forwarded-Host", frontendHost)
-
-		// CRITICAL: Don't reset session for WebSocket upgrades (would corrupt the upgrade handshake)
-		if !c.isWebsocket(r) {
-			if err = c.ResetSessionExpiration(w, r); err != nil {
-				err = errors.Wrap(err, "error resetting session expiration")
-				log.Errorf("session expiration error: %v", err)
-				http.Error(w, err.Error(), http.StatusInternalServerError)
-				return
-			}
-		}
 
 		// The reverse proxy handles both HTTP and WebSocket upgrade requests transparently
 		log.Infof("proxying request to %s%s", c.backendURL, r.URL.Path)
@@ -681,6 +694,7 @@ func main() {
 		encodedReadTimeout      = flag.String("read-timeout", "48h", "The maximum duration for reading the entire request, including the body.")
 		encodedWriteTimeout     = flag.String("write-timeout", "48h", "The maximum duration before timing out writes of the response.")
 		encodedIdleTimeout      = flag.String("idle-timeout", "5000s", "The maximum amount of time to wait for the next request when keep-alives are enabled.")
+		disableAuth             = flag.Bool("disable-auth", false, "Disable authentication and authorization. When true, allows unauthenticated access to the proxied application.")
 	)
 
 	flag.Var(&corsOrigins, "allowed-origins", "List of allowed origins, separated by commas.")
@@ -721,6 +735,7 @@ func main() {
 	log.Infof("read timeout is %s", *encodedReadTimeout)
 	log.Infof("write timeout is %s", *encodedWriteTimeout)
 	log.Infof("idle timeout is %s", *encodedIdleTimeout)
+	log.Infof("authentication disabled: %v", *disableAuth)
 
 	for _, c := range corsOrigins {
 		log.Infof("Origin: %s\n", c)
@@ -778,6 +793,7 @@ func main() {
 		checkResourceAccessBase: *checkResourceAccessBase,
 		sessionStore:            sessionStore,
 		ssoClient:               *client,
+		disableAuth:             *disableAuth,
 	}
 
 	resourceName, err := p.getResourceName(*externalID)
@@ -793,11 +809,18 @@ func main() {
 
 	r := mux.NewRouter()
 
-	// If the query contains a ticket in the query params, then it needs to be
-	// validated.
+	// Health check endpoint - always available
 	r.PathPrefix("/url-ready").HandlerFunc(p.URLIsReady)
-	r.PathPrefix("/").Queries("code", "").Handler(http.HandlerFunc(p.HandleAuthorizationCode))
-	r.PathPrefix("/").MatcherFunc(p.Session).Handler(http.HandlerFunc(p.RequireKeycloakAuth))
+
+	// Conditionally add authentication routes based on --disable-auth flag
+	if !*disableAuth {
+		// If the query contains a code parameter, handle the OAuth authorization code
+		r.PathPrefix("/").Queries("code", "").Handler(http.HandlerFunc(p.HandleAuthorizationCode))
+		// If the request doesn't have a valid session, redirect to Keycloak for authentication
+		r.PathPrefix("/").MatcherFunc(p.Session).Handler(http.HandlerFunc(p.RequireKeycloakAuth))
+	}
+
+	// Proxy all requests to the backend
 	r.PathPrefix("/").Handler(proxy)
 
 	c := cors.New(cors.Options{
