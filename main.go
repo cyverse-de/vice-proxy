@@ -45,66 +45,10 @@ type VICEProxy struct {
 	backendURL              string                // The backend URL to forward to.
 	wsbackendURL            string                // The websocket URL to forward requests to.
 	resourceName            string                // The UUID of the analysis.
-	getAnalysisIDBase       string                // The base URL for the get-analysis-id service.
 	checkResourceAccessBase string                // The base URL for the check-resource-access service.
 	sessionStore            *sessions.CookieStore // The backend session storage.
 	ssoClient               http.Client           // The HTTP client for back-channel requests to the IDP.
 	disableAuth             bool                  // If true, authentication and authorization are disabled.
-}
-
-// Analysis contains the ID for the Analysis, which gets used as the resource
-// name when checking permissions.
-type Analysis struct {
-	ID string `json:"id"` // Literally all we care about here.
-}
-
-// Analyses is a list of analyses returned by the apps service.
-type Analyses struct {
-	Analyses []Analysis `json:"analyses"`
-}
-
-func (c *VICEProxy) getResourceName(externalID string) (string, error) {
-	bodymap := map[string]string{}
-	bodymap["external_id"] = externalID
-
-	body, err := json.Marshal(bodymap)
-	if err != nil {
-		return "", err
-	}
-
-	req, err := http.NewRequest(http.MethodPost, c.getAnalysisIDBase, bytes.NewReader(body))
-	if err != nil {
-		return "", err
-	}
-
-	//log.Debugf("start of resource name lookup for %s at %s", externalID, c.getAnalysisIDBase)
-	client := &http.Client{}
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer func() { _ = resp.Body.Close() }()
-	//log.Debugf("end of resource name lookup for %s at %s", externalID, c.getAnalysisIDBase)
-
-	analysis := &Analysis{}
-	b, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", err
-	}
-
-	if resp.StatusCode > 399 {
-		return "", fmt.Errorf(`status code %d from %s: %s`, resp.StatusCode, req.URL.String(), string(b))
-	}
-
-	if err = json.Unmarshal(b, analysis); err != nil {
-		return "", err
-	}
-
-	if analysis.ID == "" {
-		return "", errors.New("no analyses found")
-	}
-
-	return analysis.ID, nil
 }
 
 // Resource is an item that can have permissions attached to it in the
@@ -687,9 +631,8 @@ func main() {
 		maxAge                  = flag.Int("max-age", 0, "The idle timeout for session, in seconds.")
 		sslCert                 = flag.String("ssl-cert", "", "Path to the SSL .crt file.")
 		sslKey                  = flag.String("ssl-key", "", "Path to the SSL .key file.")
-		getAnalysisIDBase       = flag.String("get-analysis-id-base", "http://get-analysis-id", "The base URL for the get-analysis-id service.")
 		checkResourceAccessBase = flag.String("check-resource-access-base", "http://check-resource-access", "The base URL for the check-resource-access service.")
-		externalID              = flag.String("external-id", "", "The external ID to pass to the apps service when looking up the analysis ID.")
+		analysisID              = flag.String("analysis-id", "", "The UUID of the analysis to use for authorization.")
 		encodedSSOTimeout       = flag.String("sso-timeout", "5s", "The timeout period for back-channel requests to the identity provider.")
 		encodedReadTimeout      = flag.String("read-timeout", "48h", "The maximum duration for reading the entire request, including the body.")
 		encodedWriteTimeout     = flag.String("write-timeout", "48h", "The maximum duration before timing out writes of the response.")
@@ -720,8 +663,8 @@ func main() {
 		corsOrigins = originFlags{"*.cyverse.run", "*.cyverse.org", "*.cyverse.run:4343", "cyverse.run", "cyverse.run:4343"}
 	}
 
-	if *externalID == "" {
-		log.Fatal("--external-id must be set.")
+	if *analysisID == "" {
+		log.Fatal("--analysis-id must be set.")
 	}
 
 	log.Infof("backend URL is %s", *backendURL)
@@ -789,18 +732,12 @@ func main() {
 		frontendURL:             *frontendURL,
 		backendURL:              *backendURL,
 		wsbackendURL:            *wsbackendURL,
-		getAnalysisIDBase:       *getAnalysisIDBase,
 		checkResourceAccessBase: *checkResourceAccessBase,
+		resourceName:            *analysisID,
 		sessionStore:            sessionStore,
 		ssoClient:               *client,
 		disableAuth:             *disableAuth,
 	}
-
-	resourceName, err := p.getResourceName(*externalID)
-	if err != nil {
-		log.Fatal(err)
-	}
-	p.resourceName = resourceName
 
 	proxy, err := p.Proxy()
 	if err != nil {

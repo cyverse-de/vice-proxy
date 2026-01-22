@@ -26,7 +26,6 @@ func getVICEProxy() *VICEProxy {
 		frontendURL:             "https://foobarbaz.example.run",
 		backendURL:              "http://localhost:8888",
 		wsbackendURL:            "http://localhost:8888",
-		getAnalysisIDBase:       "http://get-analysis-id",
 		checkResourceAccessBase: "http://check-resource-access",
 		sessionStore:            sessionStore,
 		disableAuth:             false,
