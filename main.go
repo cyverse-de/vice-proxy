@@ -1,7 +1,7 @@
 package main
 
 import (
-	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/json"
 	"flag"
@@ -11,6 +11,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -33,104 +34,25 @@ const stateSessionName = "state-session"
 const stateSessionKey = "state-session-key"
 const sessionName = "proxy-session"
 const sessionKey = "proxy-session-key"
+const keycloakSidKey = "keycloak-sid"
 
 // VICEProxy contains the application logic that handles authentication, session
 // validations, ticket validation, and request proxying.
 type VICEProxy struct {
-	keycloakBaseURL         string                // The URL to use when checking for Keycloak authentication.
-	keycloakRealm           string                // The realm to use when checking for Keycloak authentication.
-	keycloakClientID        string                // The OIDC client ID for Keycloak.
-	keycloakClientSecret    string                // The OIDC client secret for Keycloak.
-	frontendURL             string                // The redirect URL.
-	backendURL              string                // The backend URL to forward to.
-	wsbackendURL            string                // The websocket URL to forward requests to.
-	resourceName            string                // The UUID of the analysis.
-	checkResourceAccessBase string                // The base URL for the check-resource-access service.
-	sessionStore            *sessions.CookieStore // The backend session storage.
-	ssoClient               http.Client           // The HTTP client for back-channel requests to the IDP.
-	disableAuth             bool                  // If true, authentication and authorization are disabled.
-}
-
-// Resource is an item that can have permissions attached to it in the
-// permissions service.
-type Resource struct {
-	ID   string `json:"id"`
-	Name string `json:"name"`
-	Type string `json:"resource_type"`
-}
-
-// Subject is an item that accesses resources contained in the permissions
-// service.
-type Subject struct {
-	ID        string `json:"id"`
-	SubjectID string `json:"subject_id"`
-	SourceID  string `json:"subject_source_id"`
-	Type      string `json:"subject_type"`
-}
-
-// Permission is an entry from the permissions service that tells what access
-// a subject has to a resource.
-type Permission struct {
-	ID       string   `json:"id"`
-	Level    string   `json:"permission_level"`
-	Resource Resource `json:"resource"`
-	Subject  Subject  `json:"subject"`
-}
-
-// PermissionList contains a list of permission returned by the permissions
-// service.
-type PermissionList struct {
-	Permissions []Permission `json:"permissions"`
-}
-
-// IsAllowed will return true if the user is allowed to access the running app
-// and false if they're not. An error might be returned as well. Access should
-// be denied if an error is returned, even if the boolean return value is true.
-func (c *VICEProxy) IsAllowed(user, resource string) (bool, error) {
-	bodymap := map[string]string{
-		"subject":  user,
-		"resource": resource,
-	}
-
-	body, err := json.Marshal(bodymap)
-	if err != nil {
-		return false, err
-	}
-
-	request, err := http.NewRequest(http.MethodPost, c.checkResourceAccessBase, bytes.NewReader(body))
-	if err != nil {
-		return false, err
-	}
-
-	//log.Debugf("start of permissions lookup for user %s on resource %s at %s", user, resource, c.checkResourceAccessBase)
-	client := &http.Client{}
-	resp, err := client.Do(request)
-	if err != nil {
-		return false, err
-	}
-	defer func() { _ = resp.Body.Close() }()
-	//log.Debugf("end of permissions lookup for user %s on resource %s at %s", user, resource, c.checkResourceAccessBase)
-
-	b, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return false, err
-	}
-
-	l := &PermissionList{
-		Permissions: []Permission{},
-	}
-
-	if err = json.Unmarshal(b, l); err != nil {
-		return false, err
-	}
-
-	if len(l.Permissions) > 0 {
-		if l.Permissions[0].Level != "" {
-			return true, nil
-		}
-	}
-
-	return false, nil
+	keycloakBaseURL      string                // The URL to use when checking for Keycloak authentication.
+	keycloakRealm        string                // The realm to use when checking for Keycloak authentication.
+	keycloakClientID     string                // The OIDC client ID for Keycloak.
+	keycloakClientSecret string                // The OIDC client secret for Keycloak.
+	frontendURL          string                // The redirect URL.
+	backendURL           string                // The backend URL to forward to.
+	wsbackendURL         string                // The websocket URL to forward requests to.
+	resourceName         string                // The UUID of the analysis.
+	sessionStore         *sessions.CookieStore // The backend session storage.
+	ssoClient            http.Client           // The HTTP client for back-channel requests to the IDP.
+	disableAuth          bool                  // If true, authentication and authorization are disabled.
+	jwksAutoRefresh      *jwk.AutoRefresh      // Cached JWKS fetcher, nil if caching is disabled.
+	jwksCertsURL         string                // The resolved JWKS certs URL, set during initialization.
+	activeSessions       sync.Map              // Tracks valid Keycloak session IDs for back-channel logout.
 }
 
 // KeycloakURL generates a URL that we can use for Keycloak.
@@ -160,8 +82,12 @@ type TokenResponse struct {
 }
 
 // FetchKeycloakCerts calls Keycloak's certificate endpoint to get the set of signing certificates, and returns
-// the parsed certificate set.
+// the parsed certificate set. If JWKS caching is enabled, returns the cached key set.
 func (c *VICEProxy) FetchKeycloakCerts() (jwk.Set, error) {
+	if c.jwksAutoRefresh != nil {
+		return c.jwksAutoRefresh.Fetch(context.Background(), c.jwksCertsURL)
+	}
+
 	url, err := c.KeycloakURL("certs")
 	if err != nil {
 		return nil, err
@@ -179,6 +105,44 @@ func (c *VICEProxy) FetchKeycloakCerts() (jwk.Set, error) {
 	}
 
 	return jwk.Parse(body)
+}
+
+// CheckKeycloakAuthorization requests a UMA RPT (Requesting Party Token) from Keycloak
+// to verify that the user has access to the analysis resource. Keycloak evaluates the
+// configured authorization policies (including the vice-access policy provider) and
+// returns a token if access is granted.
+func (c *VICEProxy) CheckKeycloakAuthorization(accessToken string) error {
+	tokenURL, err := c.KeycloakURL("token")
+	if err != nil {
+		return errors.Wrap(err, "failed to build Keycloak token URL for UMA check")
+	}
+
+	formParams := url.Values{}
+	formParams.Set("grant_type", "urn:ietf:params:oauth:grant-type:uma-ticket")
+	formParams.Set("audience", c.keycloakClientID)
+	formParams.Set("permission", c.resourceName+"#access")
+
+	req, err := http.NewRequest(http.MethodPost, tokenURL.String(), strings.NewReader(formParams.Encode()))
+	if err != nil {
+		return errors.Wrap(err, "failed to create UMA authorization request")
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+
+	resp, err := c.ssoClient.Do(req)
+	if err != nil {
+		return errors.Wrap(err, "failed to send UMA authorization request to Keycloak")
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	// Drain the body so the connection can be reused.
+	_, _ = io.ReadAll(resp.Body)
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("Keycloak denied access to resource %s (HTTP %d)", c.resourceName, resp.StatusCode)
+	}
+
+	return nil
 }
 
 // ValidateKeycloakToken verifies the signature of a Keycloak token and returns a parsed version of it.
@@ -259,6 +223,7 @@ func (c *VICEProxy) HandleAuthorizationCode(w http.ResponseWriter, r *http.Reque
 	params.Del("code")
 	params.Del("session_state")
 	params.Del("state")
+	params.Del("iss") // Keycloak 24+ adds issuer to callback URL
 	redirectURL.RawQuery = params.Encode()
 	redirectURL.Path = r.URL.Path
 	//log.Debugf("redirect URL: %s", redirectURL.String())
@@ -320,6 +285,14 @@ func (c *VICEProxy) HandleAuthorizationCode(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
+	// Check authorization via Keycloak UMA. The vice-access policy provider
+	// in Keycloak will call the permissions service to verify access.
+	if err := c.CheckKeycloakAuthorization(tokenResponse.AccessToken); err != nil {
+		log.Errorf("UMA authorization denied: %v", err)
+		http.Error(w, "access denied", http.StatusForbidden)
+		return
+	}
+
 	// Get the username from the token.
 	username, ok := token.Get("preferred_username")
 	if !ok {
@@ -329,11 +302,29 @@ func (c *VICEProxy) HandleAuthorizationCode(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	// Store the username in the session.
+	// Store the username and Keycloak session ID in the session.
 	var s *sessions.Session
-	s, _ = c.sessionStore.Get(r, sessionName)
+	s, err = c.sessionStore.Get(r, sessionName)
+	if err != nil {
+		log.Warnf("failed to get session store, creating new session: %v", err)
+	}
 	s.Values[sessionKey] = username
-	_ = s.Save(r, w)
+
+	// Extract and store the Keycloak session ID for back-channel logout support.
+	if sid, ok := token.Get("sid"); ok {
+		sidStr, ok := sid.(string)
+		if ok && sidStr != "" {
+			s.Values[keycloakSidKey] = sidStr
+			c.activeSessions.Store(sidStr, true)
+			log.Debugf("registered active session: %s", sidStr)
+		}
+	}
+
+	if err = s.Save(r, w); err != nil {
+		log.Errorf("failed to save session: %v", err)
+		http.Error(w, "failed to save session", http.StatusInternalServerError)
+		return
+	}
 
 	// Redirect the user to the redirect URL, which was determined above.
 	//log.Debugf("redirecting the user to: %s", redirectURL.String())
@@ -409,8 +400,140 @@ func (c *VICEProxy) ResetSessionExpiration(w http.ResponseWriter, r *http.Reques
 	return nil
 }
 
+// HandleLogout clears the vice-proxy session and redirects to Keycloak logout.
+func (c *VICEProxy) HandleLogout(w http.ResponseWriter, r *http.Request) {
+	log.Debug("handling logout request")
+
+	// Clear the vice-proxy session and remove from active sessions
+	session, err := c.sessionStore.Get(r, sessionName)
+	if err != nil {
+		log.Warnf("failed to get session during logout: %v", err)
+	} else {
+		// Remove from active sessions map if sid exists
+		if sidRaw, ok := session.Values[keycloakSidKey]; ok {
+			if sid, ok := sidRaw.(string); ok {
+				c.activeSessions.Delete(sid)
+				log.Debugf("removed session %s from active sessions", sid)
+			}
+		}
+	}
+	session.Options.MaxAge = -1 // Delete the cookie
+	if err = session.Save(r, w); err != nil {
+		log.Errorf("failed to save session during logout: %v", err)
+	}
+
+	// Also clear the state session
+	stateSession, err := c.sessionStore.Get(r, stateSessionName)
+	if err != nil {
+		log.Warnf("failed to get state session during logout: %v", err)
+	}
+	stateSession.Options.MaxAge = -1
+	if err = stateSession.Save(r, w); err != nil {
+		log.Errorf("failed to save state session during logout: %v", err)
+	}
+
+	// Build the Keycloak logout URL
+	logoutURL, err := url.Parse(c.keycloakBaseURL)
+	if err != nil {
+		log.Errorf("failed to parse Keycloak base URL for logout: %v", err)
+		http.Error(w, "logout failed", http.StatusInternalServerError)
+		return
+	}
+	logoutURL.Path = fmt.Sprintf("/realms/%s/protocol/openid-connect/logout", c.keycloakRealm)
+
+	// Set the post-logout redirect to the frontend URL
+	params := logoutURL.Query()
+	params.Set("post_logout_redirect_uri", c.frontendURL)
+	params.Set("client_id", c.keycloakClientID)
+	logoutURL.RawQuery = params.Encode()
+
+	log.Debugf("redirecting to Keycloak logout: %s", logoutURL.String())
+	http.Redirect(w, r, logoutURL.String(), http.StatusTemporaryRedirect)
+}
+
+// HandleBackChannelLogout handles back-channel logout notifications from Keycloak.
+// This endpoint receives a logout_token when a user logs out from Keycloak or any
+// connected application. The token contains the session ID (sid) which is used to
+// invalidate the local session.
+func (c *VICEProxy) HandleBackChannelLogout(w http.ResponseWriter, r *http.Request) {
+	log.Debug("handling back-channel logout request")
+
+	if r.Method != http.MethodPost {
+		log.Errorf("back-channel logout requires POST method, got %s", r.Method)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Parse the logout_token from the form body
+	if err := r.ParseForm(); err != nil {
+		log.Errorf("failed to parse form in back-channel logout: %v", err)
+		http.Error(w, "invalid request", http.StatusBadRequest)
+		return
+	}
+
+	logoutToken := r.FormValue("logout_token")
+	if logoutToken == "" {
+		log.Error("no logout_token in back-channel logout request")
+		http.Error(w, "missing logout_token", http.StatusBadRequest)
+		return
+	}
+
+	// Validate the logout token signature using Keycloak's JWKS
+	token, err := c.ValidateKeycloakToken(logoutToken)
+	if err != nil {
+		log.Errorf("failed to validate logout token: %v", err)
+		http.Error(w, "invalid token", http.StatusBadRequest)
+		return
+	}
+
+	// Verify this is a logout token by checking for the events claim
+	events, ok := token.Get("events")
+	if !ok {
+		log.Error("logout token missing events claim")
+		http.Error(w, "invalid logout token: missing events", http.StatusBadRequest)
+		return
+	}
+
+	// The events claim should be a map containing the backchannel-logout event
+	eventsMap, ok := events.(map[string]interface{})
+	if !ok {
+		log.Errorf("logout token events claim is not a map: %T", events)
+		http.Error(w, "invalid logout token: malformed events", http.StatusBadRequest)
+		return
+	}
+
+	// Check for the back-channel logout event key
+	if _, ok := eventsMap["http://schemas.openid.net/event/backchannel-logout"]; !ok {
+		log.Error("logout token does not contain backchannel-logout event")
+		http.Error(w, "invalid logout token: not a backchannel logout", http.StatusBadRequest)
+		return
+	}
+
+	// Extract the session ID (sid) from the token
+	sidRaw, ok := token.Get("sid")
+	if !ok {
+		log.Error("logout token missing sid claim")
+		http.Error(w, "invalid logout token: missing sid", http.StatusBadRequest)
+		return
+	}
+
+	sid, ok := sidRaw.(string)
+	if !ok || sid == "" {
+		log.Errorf("logout token sid claim is not a valid string: %T", sidRaw)
+		http.Error(w, "invalid logout token: invalid sid", http.StatusBadRequest)
+		return
+	}
+
+	// Invalidate the session
+	c.activeSessions.Delete(sid)
+	log.Infof("invalidated session %s via back-channel logout", sid)
+
+	// Return 200 OK per the OIDC Back-Channel Logout spec
+	w.WriteHeader(http.StatusOK)
+}
+
 // Session implements the mux.Matcher interface so that requests can be routed
-// based on cookie existence.
+// based on cookie existence. Returns true if authentication is required.
 func (c *VICEProxy) Session(r *http.Request, m *mux.RouteMatch) bool {
 	session, err := c.sessionStore.Get(r, sessionName)
 	if err != nil {
@@ -425,6 +548,19 @@ func (c *VICEProxy) Session(r *http.Request, m *mux.RouteMatch) bool {
 	if msg == "" {
 		log.Debug("session value was empty instead of a username")
 		return true
+	}
+
+	// Check if session was invalidated via back-channel logout
+	if sidRaw, ok := session.Values[keycloakSidKey]; ok {
+		sid, ok := sidRaw.(string)
+		if !ok || sid == "" {
+			log.Debug("session has invalid keycloak sid")
+			return true
+		}
+		if _, valid := c.activeSessions.Load(sid); !valid {
+			log.Debugf("session %s was invalidated via back-channel logout", sid)
+			return true
+		}
 	}
 
 	return false
@@ -545,15 +681,21 @@ func (c *VICEProxy) authenticateAndAuthorize(w http.ResponseWriter, r *http.Requ
 	}
 	log.Infof("authenticated user: %s", username)
 
-	// Check to make sure the user can access the resource.
-	allowed, err := c.IsAllowed(username, c.resourceName)
-	if !allowed || err != nil {
-		if err != nil {
-			return "", errors.Wrap(err, "access denied")
+	// Check if session was invalidated via back-channel logout
+	if sidRaw, ok := session.Values[keycloakSidKey]; ok {
+		sid, ok := sidRaw.(string)
+		if !ok || sid == "" {
+			return "", errors.New("invalid session ID in cookie")
 		}
-		return "", errors.New("access denied")
+		if _, valid := c.activeSessions.Load(sid); !valid {
+			log.Infof("session %s was invalidated via back-channel logout", sid)
+			return "", errors.New("session invalidated")
+		}
 	}
-	log.Infof("user %s authorized for resource %s", username, c.resourceName)
+
+	// Authorization was already checked via Keycloak UMA during login
+	// (HandleAuthorizationCode). The session's existence proves the user
+	// was authorized when they authenticated.
 
 	// CRITICAL: Don't reset session for WebSocket upgrades (would corrupt the upgrade handshake)
 	if !c.isWebsocket(r) {
@@ -629,15 +771,15 @@ func main() {
 		keycloakClientID        = flag.String("keycloak-client-id", "", "The ID of the OIDC client to use for Keycloak.")
 		keycloakClientSecret    = flag.String("keycloak-client-secret", "", "The secret of the OIDC client to use for Keycloak.")
 		maxAge                  = flag.Int("max-age", 0, "The idle timeout for session, in seconds.")
-		sslCert                 = flag.String("ssl-cert", "", "Path to the SSL .crt file.")
-		sslKey                  = flag.String("ssl-key", "", "Path to the SSL .key file.")
-		checkResourceAccessBase = flag.String("check-resource-access-base", "http://check-resource-access", "The base URL for the check-resource-access service.")
-		analysisID              = flag.String("analysis-id", "", "The UUID of the analysis to use for authorization.")
+		sslCert    = flag.String("ssl-cert", "", "Path to the SSL .crt file.")
+		sslKey     = flag.String("ssl-key", "", "Path to the SSL .key file.")
+		analysisID = flag.String("analysis-id", "", "The UUID of the analysis to use for authorization.")
 		encodedSSOTimeout       = flag.String("sso-timeout", "5s", "The timeout period for back-channel requests to the identity provider.")
 		encodedReadTimeout      = flag.String("read-timeout", "48h", "The maximum duration for reading the entire request, including the body.")
 		encodedWriteTimeout     = flag.String("write-timeout", "48h", "The maximum duration before timing out writes of the response.")
 		encodedIdleTimeout      = flag.String("idle-timeout", "5000s", "The maximum amount of time to wait for the next request when keep-alives are enabled.")
 		disableAuth             = flag.Bool("disable-auth", false, "Disable authentication and authorization. When true, allows unauthenticated access to the proxied application.")
+		encodedJWKSCacheTTL     = flag.String("jwks-cache-ttl", "1h", "How long to cache Keycloak JWKS certificates. Set to 0 to disable caching.")
 	)
 
 	flag.Var(&corsOrigins, "allowed-origins", "List of allowed origins, separated by commas.")
@@ -724,19 +866,41 @@ func main() {
 		Timeout: ssoTimeout,
 	}
 
+	// Parse the JWKS cache TTL.
+	jwksCacheTTL, err := time.ParseDuration(*encodedJWKSCacheTTL)
+	if err != nil {
+		log.Fatalf("invalid JWKS cache TTL duration: %s", err.Error())
+	}
+
 	p := &VICEProxy{
-		keycloakBaseURL:         *keycloakBaseURL,
-		keycloakRealm:           *keycloakRealm,
-		keycloakClientID:        *keycloakClientID,
-		keycloakClientSecret:    *keycloakClientSecret,
-		frontendURL:             *frontendURL,
-		backendURL:              *backendURL,
-		wsbackendURL:            *wsbackendURL,
-		checkResourceAccessBase: *checkResourceAccessBase,
-		resourceName:            *analysisID,
-		sessionStore:            sessionStore,
-		ssoClient:               *client,
-		disableAuth:             *disableAuth,
+		keycloakBaseURL:      *keycloakBaseURL,
+		keycloakRealm:        *keycloakRealm,
+		keycloakClientID:     *keycloakClientID,
+		keycloakClientSecret: *keycloakClientSecret,
+		frontendURL:          *frontendURL,
+		backendURL:           *backendURL,
+		wsbackendURL:         *wsbackendURL,
+		resourceName:         *analysisID,
+		sessionStore:         sessionStore,
+		ssoClient:            *client,
+		disableAuth:          *disableAuth,
+	}
+
+	// Set up JWKS caching if auth is enabled and TTL is positive.
+	if !*disableAuth && jwksCacheTTL > 0 {
+		certsURL, err := p.KeycloakURL("certs")
+		if err != nil {
+			log.Fatalf("failed to build Keycloak certs URL: %s", err.Error())
+		}
+		p.jwksCertsURL = certsURL.String()
+
+		ar := jwk.NewAutoRefresh(context.Background())
+		ar.Configure(p.jwksCertsURL, jwk.WithMinRefreshInterval(jwksCacheTTL))
+
+		p.jwksAutoRefresh = ar
+		log.Infof("JWKS caching enabled with minimum refresh interval of %s", jwksCacheTTL)
+	} else if !*disableAuth {
+		log.Info("JWKS caching disabled, certificates will be fetched on every token validation")
 	}
 
 	proxy, err := p.Proxy()
@@ -749,8 +913,14 @@ func main() {
 	// Health check endpoint - always available
 	r.PathPrefix("/url-ready").HandlerFunc(p.URLIsReady)
 
+	// Back-channel logout endpoint - receives logout notifications from Keycloak
+	// This must be available even if auth is disabled, as it's called by Keycloak/app-exposer
+	r.Path("/backchannel-logout").Methods("POST").HandlerFunc(p.HandleBackChannelLogout)
+
 	// Conditionally add authentication routes based on --disable-auth flag
 	if !*disableAuth {
+		// Logout endpoint - clears session and redirects to Keycloak logout
+		r.Path("/logout").HandlerFunc(p.HandleLogout)
 		// If the query contains a code parameter, handle the OAuth authorization code
 		r.PathPrefix("/").Queries("code", "").Handler(http.HandlerFunc(p.HandleAuthorizationCode))
 		// If the request doesn't have a valid session, redirect to Keycloak for authentication
