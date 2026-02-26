@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -650,6 +651,20 @@ func (c *VICEProxy) URLIsReady(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// FrontendURL returns the configured frontend URL as JSON. Called by
+// app-exposer via the in-cluster Service to discover the access URL.
+func (c *VICEProxy) FrontendURL(w http.ResponseWriter, r *http.Request) {
+	body, err := json.Marshal(map[string]string{"url": c.frontendURL})
+	if err != nil {
+		log.Errorf("failed to encode frontend URL response: %v", err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = w.Write(body)
+}
+
 // GetFrontendHost returns the host and port portions of the resource name.
 func (c *VICEProxy) GetFrontendHost() (string, error) {
 	svcURL, err := url.Parse(c.frontendURL)
@@ -785,6 +800,23 @@ func main() {
 	flag.Var(&corsOrigins, "allowed-origins", "List of allowed origins, separated by commas.")
 	flag.Parse()
 
+	// Derive frontendURL from VICE_BASE_URL env var if set. The pod hostname
+	// is the subdomain hash set by app-exposer, so combining it with the base
+	// URL produces the full analysis URL.
+	if baseURL := os.Getenv("VICE_BASE_URL"); baseURL != "" {
+		hostname, err := os.Hostname()
+		if err != nil {
+			log.Fatalf("failed to get hostname for VICE_BASE_URL: %v", err)
+		}
+		parsedBase, err := url.Parse(baseURL)
+		if err != nil {
+			log.Fatalf("failed to parse VICE_BASE_URL %q: %v", baseURL, err)
+		}
+		parsedBase.Host = fmt.Sprintf("%s.%s", hostname, parsedBase.Host)
+		*frontendURL = parsedBase.String()
+		log.Infof("derived frontend URL from VICE_BASE_URL: %s", *frontendURL)
+	}
+
 	if *frontendURL == "" {
 		log.Fatal("--frontend-url must be set.")
 	}
@@ -910,8 +942,9 @@ func main() {
 
 	r := mux.NewRouter()
 
-	// Health check endpoint - always available
+	// Unauthenticated endpoints — health check and internal info.
 	r.PathPrefix("/url-ready").HandlerFunc(p.URLIsReady)
+	r.Path("/frontend-url").Methods(http.MethodGet).HandlerFunc(p.FrontendURL)
 
 	// Back-channel logout endpoint - receives logout notifications from Keycloak
 	// This must be available even if auth is disabled, as it's called by Keycloak/app-exposer
