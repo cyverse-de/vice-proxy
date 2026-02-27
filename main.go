@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/json"
@@ -50,10 +51,91 @@ type VICEProxy struct {
 	resourceName         string                // The UUID of the analysis.
 	sessionStore         *sessions.CookieStore // The backend session storage.
 	ssoClient            http.Client           // The HTTP client for back-channel requests to the IDP.
-	disableAuth          bool                  // If true, authentication and authorization are disabled.
-	jwksAutoRefresh      *jwk.AutoRefresh      // Cached JWKS fetcher, nil if caching is disabled.
-	jwksCertsURL         string                // The resolved JWKS certs URL, set during initialization.
-	activeSessions       sync.Map              // Tracks valid Keycloak session IDs for back-channel logout.
+	disableAuth             bool                  // If true, authentication and authorization are disabled.
+	enableLegacyAuth        bool                  // If true, use per-request check-resource-access instead of Keycloak UMA.
+	checkResourceAccessBase string                // Base URL for the check-resource-access service (legacy mode).
+	jwksAutoRefresh         *jwk.AutoRefresh      // Cached JWKS fetcher, nil if caching is disabled.
+	jwksCertsURL            string                // The resolved JWKS certs URL, set during initialization.
+	activeSessions          sync.Map              // Tracks valid Keycloak session IDs for back-channel logout.
+}
+
+// Resource is an item that can have permissions attached to it in the
+// permissions service.
+type Resource struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+	Type string `json:"resource_type"`
+}
+
+// Subject is an item that accesses resources contained in the permissions
+// service.
+type Subject struct {
+	ID        string `json:"id"`
+	SubjectID string `json:"subject_id"`
+	SourceID  string `json:"subject_source_id"`
+	Type      string `json:"subject_type"`
+}
+
+// Permission is an entry from the permissions service that tells what access
+// a subject has to a resource.
+type Permission struct {
+	ID       string   `json:"id"`
+	Level    string   `json:"permission_level"`
+	Resource Resource `json:"resource"`
+	Subject  Subject  `json:"subject"`
+}
+
+// PermissionList contains a list of permissions returned by the permissions
+// service.
+type PermissionList struct {
+	Permissions []Permission `json:"permissions"`
+}
+
+// IsAllowed returns true if the user has permission to access the resource
+// via the check-resource-access service. Used in legacy auth mode only.
+func (c *VICEProxy) IsAllowed(user, resource string) (bool, error) {
+	bodymap := map[string]string{
+		"subject":  user,
+		"resource": resource,
+	}
+
+	body, err := json.Marshal(bodymap)
+	if err != nil {
+		return false, err
+	}
+
+	request, err := http.NewRequest(http.MethodPost, c.checkResourceAccessBase, bytes.NewReader(body))
+	if err != nil {
+		return false, err
+	}
+
+	client := &http.Client{}
+	resp, err := client.Do(request)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return false, err
+	}
+
+	l := &PermissionList{
+		Permissions: []Permission{},
+	}
+
+	if err = json.Unmarshal(b, l); err != nil {
+		return false, err
+	}
+
+	if len(l.Permissions) > 0 {
+		if l.Permissions[0].Level != "" {
+			return true, nil
+		}
+	}
+
+	return false, nil
 }
 
 // KeycloakURL generates a URL that we can use for Keycloak.
@@ -286,12 +368,16 @@ func (c *VICEProxy) HandleAuthorizationCode(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	// Check authorization via Keycloak UMA. The vice-access policy provider
-	// in Keycloak will call the permissions service to verify access.
-	if err := c.CheckKeycloakAuthorization(tokenResponse.AccessToken); err != nil {
-		log.Errorf("UMA authorization denied: %v", err)
-		http.Error(w, "access denied", http.StatusForbidden)
-		return
+	// Check authorization via Keycloak UMA unless legacy auth is enabled.
+	// In legacy mode, authorization is deferred to per-request IsAllowed() checks.
+	if !c.enableLegacyAuth {
+		if err := c.CheckKeycloakAuthorization(tokenResponse.AccessToken); err != nil {
+			log.Errorf("UMA authorization denied: %v", err)
+			http.Error(w, "access denied", http.StatusForbidden)
+			return
+		}
+	} else {
+		log.Debug("legacy auth enabled, skipping UMA authorization check at login")
 	}
 
 	// Get the username from the token.
@@ -708,9 +794,18 @@ func (c *VICEProxy) authenticateAndAuthorize(w http.ResponseWriter, r *http.Requ
 		}
 	}
 
-	// Authorization was already checked via Keycloak UMA during login
-	// (HandleAuthorizationCode). The session's existence proves the user
-	// was authorized when they authenticated.
+	// In legacy mode, check permissions per-request via the check-resource-access service.
+	// In default (Keycloak UMA) mode, authorization was already checked at login.
+	if c.enableLegacyAuth {
+		allowed, err := c.IsAllowed(username, c.resourceName)
+		if err != nil {
+			return "", errors.Wrap(err, "legacy permission check failed")
+		}
+		if !allowed {
+			return "", fmt.Errorf("user %s is not allowed to access %s", username, c.resourceName)
+		}
+		log.Infof("legacy auth: user %s authorized for resource %s", username, c.resourceName)
+	}
 
 	// CRITICAL: Don't reset session for WebSocket upgrades (would corrupt the upgrade handshake)
 	if !c.isWebsocket(r) {
@@ -794,6 +889,8 @@ func main() {
 		encodedWriteTimeout     = flag.String("write-timeout", "48h", "The maximum duration before timing out writes of the response.")
 		encodedIdleTimeout      = flag.String("idle-timeout", "5000s", "The maximum amount of time to wait for the next request when keep-alives are enabled.")
 		disableAuth             = flag.Bool("disable-auth", false, "Disable authentication and authorization. When true, allows unauthenticated access to the proxied application.")
+		enableLegacyAuth        = flag.Bool("enable-legacy-auth", false, "Use per-request check-resource-access calls instead of Keycloak UMA authorization.")
+		checkResourceAccessBase = flag.String("check-resource-access-base", "http://check-resource-access", "Base URL for the check-resource-access service (legacy auth mode).")
 		encodedJWKSCacheTTL     = flag.String("jwks-cache-ttl", "1h", "How long to cache Keycloak JWKS certificates. Set to 0 to disable caching.")
 	)
 
@@ -853,6 +950,10 @@ func main() {
 	log.Infof("write timeout is %s", *encodedWriteTimeout)
 	log.Infof("idle timeout is %s", *encodedIdleTimeout)
 	log.Infof("authentication disabled: %v", *disableAuth)
+	log.Infof("legacy auth enabled: %v", *enableLegacyAuth)
+	if *enableLegacyAuth {
+		log.Infof("check-resource-access base URL: %s", *checkResourceAccessBase)
+	}
 
 	for _, c := range corsOrigins {
 		log.Infof("Origin: %s\n", c)
@@ -905,17 +1006,19 @@ func main() {
 	}
 
 	p := &VICEProxy{
-		keycloakBaseURL:      *keycloakBaseURL,
-		keycloakRealm:        *keycloakRealm,
-		keycloakClientID:     *keycloakClientID,
-		keycloakClientSecret: *keycloakClientSecret,
-		frontendURL:          *frontendURL,
-		backendURL:           *backendURL,
-		wsbackendURL:         *wsbackendURL,
-		resourceName:         *analysisID,
-		sessionStore:         sessionStore,
-		ssoClient:            *client,
-		disableAuth:          *disableAuth,
+		keycloakBaseURL:         *keycloakBaseURL,
+		keycloakRealm:           *keycloakRealm,
+		keycloakClientID:        *keycloakClientID,
+		keycloakClientSecret:    *keycloakClientSecret,
+		frontendURL:             *frontendURL,
+		backendURL:              *backendURL,
+		wsbackendURL:            *wsbackendURL,
+		resourceName:            *analysisID,
+		sessionStore:            sessionStore,
+		ssoClient:               *client,
+		disableAuth:             *disableAuth,
+		enableLegacyAuth:        *enableLegacyAuth,
+		checkResourceAccessBase: *checkResourceAccessBase,
 	}
 
 	// Set up JWKS caching if auth is enabled and TTL is positive.
