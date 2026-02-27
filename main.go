@@ -222,7 +222,7 @@ func (c *VICEProxy) CheckKeycloakAuthorization(accessToken string) error {
 	_, _ = io.ReadAll(resp.Body)
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("Keycloak denied access to resource %s (HTTP %d)", c.resourceName, resp.StatusCode)
+		return fmt.Errorf("keycloak denied access to resource %s (HTTP %d)", c.resourceName, resp.StatusCode)
 	}
 
 	return nil
