@@ -482,9 +482,13 @@ func (c *VICEProxy) ResetSessionExpiration(w http.ResponseWriter, r *http.Reques
 		return errors.New("session value not found")
 	}
 
-	session.Values[sessionKey] = msg.(string)
-	_ = session.Save(r, w)
-	return nil
+	str, ok := msg.(string)
+	if !ok {
+		return errors.New("session value is not a string")
+	}
+
+	session.Values[sessionKey] = str
+	return session.Save(r, w)
 }
 
 // HandleLogout clears the vice-proxy session and redirects to Keycloak logout.
@@ -631,9 +635,9 @@ func (c *VICEProxy) Session(r *http.Request, m *mux.RouteMatch) bool {
 	if !ok {
 		return true
 	}
-	msg := msgraw.(string)
-	if msg == "" {
-		log.Debug("session value was empty instead of a username")
+	msg, ok := msgraw.(string)
+	if !ok || msg == "" {
+		log.Debug("session value was empty or not a string")
 		return true
 	}
 
@@ -700,6 +704,9 @@ func (c *VICEProxy) backendIsReady(backendURL string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
+	defer func() { _ = resp.Body.Close() }()
+	_, _ = io.ReadAll(resp.Body) // drain so connection can be reused
+
 	if resp.StatusCode >= 200 && resp.StatusCode <= 399 {
 		return true, nil
 	}
