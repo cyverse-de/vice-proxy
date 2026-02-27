@@ -1,5 +1,5 @@
 # First stage: Build the binary
-FROM golang:1.24 AS build-root
+FROM golang:1.25 AS build-root
 
 WORKDIR /build
 
