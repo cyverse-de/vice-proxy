@@ -41,16 +41,16 @@ const keycloakSidKey = "keycloak-sid"
 // VICEProxy contains the application logic that handles authentication, session
 // validations, ticket validation, and request proxying.
 type VICEProxy struct {
-	keycloakBaseURL      string                // The URL to use when checking for Keycloak authentication.
-	keycloakRealm        string                // The realm to use when checking for Keycloak authentication.
-	keycloakClientID     string                // The OIDC client ID for Keycloak.
-	keycloakClientSecret string                // The OIDC client secret for Keycloak.
-	frontendURL          string                // The redirect URL.
-	backendURL           string                // The backend URL to forward to.
-	wsbackendURL         string                // The websocket URL to forward requests to.
-	resourceName         string                // The UUID of the analysis.
-	sessionStore         *sessions.CookieStore // The backend session storage.
-	ssoClient            http.Client           // The HTTP client for back-channel requests to the IDP.
+	keycloakBaseURL         string                // The URL to use when checking for Keycloak authentication.
+	keycloakRealm           string                // The realm to use when checking for Keycloak authentication.
+	keycloakClientID        string                // The OIDC client ID for Keycloak.
+	keycloakClientSecret    string                // The OIDC client secret for Keycloak.
+	frontendURL             string                // The redirect URL.
+	backendURL              string                // The backend URL to forward to.
+	wsbackendURL            string                // The websocket URL to forward requests to.
+	resourceName            string                // The UUID of the analysis.
+	sessionStore            *sessions.CookieStore // The backend session storage.
+	ssoClient               http.Client           // The HTTP client for back-channel requests to the IDP.
 	disableAuth             bool                  // If true, authentication and authorization are disabled.
 	enableLegacyAuth        bool                  // If true, use per-request check-resource-access instead of Keycloak UMA.
 	checkResourceAccessBase string                // Base URL for the check-resource-access service (legacy mode).
@@ -109,8 +109,7 @@ func (c *VICEProxy) IsAllowed(user, resource string) (bool, error) {
 		return false, err
 	}
 
-	client := &http.Client{}
-	resp, err := client.Do(request)
+	resp, err := c.ssoClient.Do(request)
 	if err != nil {
 		return false, err
 	}
@@ -138,21 +137,18 @@ func (c *VICEProxy) IsAllowed(user, resource string) (bool, error) {
 	return false, nil
 }
 
-// KeycloakURL generates a URL that we can use for Keycloak.
+// KeycloakURL generates a URL for a Keycloak OpenID Connect endpoint. Optional
+// path components are appended after the base OpenID Connect path.
 func (c *VICEProxy) KeycloakURL(components ...string) (*url.URL, error) {
 	keycloakURL, err := url.Parse(c.keycloakBaseURL)
 	if err != nil {
 		return nil, err
 	}
 
-	// Add the known parts of the URL.
-	cs := append(
-		[]string{keycloakURL.Path, "realms", c.keycloakRealm, "protocol", "openid-connect"},
-		components...,
-	)
-	keycloakURL.Path = strings.Join(cs, "/")
-
-	return keycloakURL, nil
+	// Build the fixed OpenID Connect path prefix, then append any caller-supplied
+	// components. JoinPath handles percent-encoding and slash normalization.
+	parts := append([]string{"realms", c.keycloakRealm, "protocol", "openid-connect"}, components...)
+	return keycloakURL.JoinPath(parts...), nil
 }
 
 // TokenResponse represents the response to an OpenID Connect token endpoint.
@@ -251,7 +247,6 @@ func (c *VICEProxy) HandleAuthorizationCode(w http.ResponseWriter, r *http.Reque
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	//log.Debugf("state query parameter value: %s", actualState)
 	session, err := c.sessionStore.Get(r, stateSessionName)
 	if err != nil {
 		err = errors.New("unable to get the state session")
@@ -266,7 +261,6 @@ func (c *VICEProxy) HandleAuthorizationCode(w http.ResponseWriter, r *http.Reque
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	//log.Debugf("expected state value: %s", expectedState)
 	if expectedState != actualState {
 		err = errors.New("expected state ID does not equal actual state ID")
 		log.Error(err)
@@ -276,7 +270,6 @@ func (c *VICEProxy) HandleAuthorizationCode(w http.ResponseWriter, r *http.Reque
 
 	// Extract the authorization code from the request URL.
 	code := r.URL.Query().Get("code")
-	//log.Debugf("authorization code: %s", code)
 	if code == "" {
 		err = errors.New("authorization code not found in query string")
 		log.Error(err)
@@ -286,7 +279,6 @@ func (c *VICEProxy) HandleAuthorizationCode(w http.ResponseWriter, r *http.Reque
 
 	// Build the token URL.
 	tokenURL, err := c.KeycloakURL("token")
-	//log.Debugf("token URL: %s", tokenURL.String())
 	if err != nil {
 		err = errors.Wrap(err, "failed to create the Keycloak token URL")
 		log.Error(err)
@@ -309,7 +301,6 @@ func (c *VICEProxy) HandleAuthorizationCode(w http.ResponseWriter, r *http.Reque
 	params.Del("iss") // Keycloak 24+ adds issuer to callback URL
 	redirectURL.RawQuery = params.Encode()
 	redirectURL.Path = r.URL.Path
-	//log.Debugf("redirect URL: %s", redirectURL.String())
 
 	// Build the form parameters.
 	formParams := url.Values{}
@@ -318,7 +309,6 @@ func (c *VICEProxy) HandleAuthorizationCode(w http.ResponseWriter, r *http.Reque
 	formParams.Set("redirect_uri", redirectURL.String())
 	formParams.Set("client_id", c.keycloakClientID)
 	formParams.Set("client_secret", c.keycloakClientSecret)
-	//log.Debugf("form params: %s", formParams.Encode())
 
 	// Attempt to get the token.
 	log.Debug("attempting to exchange the authorization code for a token")
@@ -352,12 +342,11 @@ func (c *VICEProxy) HandleAuthorizationCode(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	if tokenResponse.AccessToken == "" {
-		err = fmt.Errorf("no access token found in response from Keycloak")
+		err = errors.New("no access token found in response from Keycloak")
 		log.Error(err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	//log.Debugf("access token: %s", tokenResponse.AccessToken)
 
 	// Validate the token.
 	token, err := c.ValidateKeycloakToken(tokenResponse.AccessToken)
@@ -383,7 +372,7 @@ func (c *VICEProxy) HandleAuthorizationCode(w http.ResponseWriter, r *http.Reque
 	// Get the username from the token.
 	username, ok := token.Get("preferred_username")
 	if !ok {
-		err = fmt.Errorf("no username found in the token from Keycloak")
+		err = errors.New("no username found in the token from Keycloak")
 		log.Error(err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -414,7 +403,6 @@ func (c *VICEProxy) HandleAuthorizationCode(w http.ResponseWriter, r *http.Reque
 	}
 
 	// Redirect the user to the redirect URL, which was determined above.
-	//log.Debugf("redirecting the user to: %s", redirectURL.String())
 	http.Redirect(w, r, redirectURL.String(), http.StatusTemporaryRedirect)
 }
 
@@ -437,7 +425,6 @@ func (c *VICEProxy) RequireKeycloakAuth(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	//log.Debugf("generated state ID: %s", stateID.String())
 
 	// Build the redirect URL.
 	redirectURL, err := url.Parse(c.frontendURL)
@@ -448,7 +435,6 @@ func (c *VICEProxy) RequireKeycloakAuth(w http.ResponseWriter, r *http.Request) 
 	}
 	redirectURL.Path = r.URL.Path
 	redirectURL.RawQuery = r.URL.RawQuery
-	//log.Debugf("redirect URL: %s", redirectURL.String())
 
 	// Build the login URL and set the query parameters.
 	loginURL, err := c.KeycloakURL("auth")
@@ -466,7 +452,6 @@ func (c *VICEProxy) RequireKeycloakAuth(w http.ResponseWriter, r *http.Request) 
 	loginURL.RawQuery = params.Encode()
 
 	// Redirect the user to the login URL.
-	//log.Debugf("redirecting the user to %s", loginURL.String())
 	http.Redirect(w, r, loginURL.String(), http.StatusTemporaryRedirect)
 }
 
@@ -523,14 +508,13 @@ func (c *VICEProxy) HandleLogout(w http.ResponseWriter, r *http.Request) {
 		log.Errorf("failed to save state session during logout: %v", err)
 	}
 
-	// Build the Keycloak logout URL
-	logoutURL, err := url.Parse(c.keycloakBaseURL)
+	// Build the Keycloak logout URL.
+	logoutURL, err := c.KeycloakURL("logout")
 	if err != nil {
-		log.Errorf("failed to parse Keycloak base URL for logout: %v", err)
+		log.Errorf("failed to build Keycloak logout URL: %v", err)
 		http.Error(w, "logout failed", http.StatusInternalServerError)
 		return
 	}
-	logoutURL.Path = fmt.Sprintf("/realms/%s/protocol/openid-connect/logout", c.keycloakRealm)
 
 	// Set the post-logout redirect to the frontend URL
 	params := logoutURL.Query()
@@ -681,22 +665,14 @@ func (c *VICEProxy) ReverseProxy() (*httputil.ReverseProxy, error) {
 	return proxy, nil
 }
 
-// isWebsocket returns true if the connection is a websocket request. Adapted
-// from the code at https://groups.google.com/d/msg/golang-nuts/KBx9pDlvFOc/0tR1gBRfFVMJ.
+// isWebsocket returns true if the request is a WebSocket upgrade request. Adapted
+// from https://groups.google.com/d/msg/golang-nuts/KBx9pDlvFOc/0tR1gBRfFVMJ.
 func (c *VICEProxy) isWebsocket(r *http.Request) bool {
-	connectionHeader := ""
-	allHeaders := r.Header["Connection"]
-	if len(allHeaders) > 0 {
-		connectionHeader = allHeaders[0]
+	connection := r.Header.Get("Connection")
+	if !strings.Contains(strings.ToLower(connection), "upgrade") {
+		return false
 	}
-
-	upgrade := false
-	if strings.Contains(strings.ToLower(connectionHeader), "upgrade") {
-		if len(r.Header["Upgrade"]) > 0 {
-			upgrade = (strings.ToLower(r.Header["Upgrade"][0]) == "websocket")
-		}
-	}
-	return upgrade
+	return strings.ToLower(r.Header.Get("Upgrade")) == "websocket"
 }
 
 func (c *VICEProxy) backendIsReady(backendURL string) (bool, error) {
@@ -711,7 +687,6 @@ func (c *VICEProxy) backendIsReady(backendURL string) (bool, error) {
 		return true, nil
 	}
 	return false, nil
-
 }
 
 // URLIsReady will write out a JSON-encoded response in the format
@@ -888,9 +863,9 @@ func main() {
 		keycloakClientID        = flag.String("keycloak-client-id", "", "The ID of the OIDC client to use for Keycloak.")
 		keycloakClientSecret    = flag.String("keycloak-client-secret", "", "The secret of the OIDC client to use for Keycloak.")
 		maxAge                  = flag.Int("max-age", 0, "The idle timeout for session, in seconds.")
-		sslCert    = flag.String("ssl-cert", "", "Path to the SSL .crt file.")
-		sslKey     = flag.String("ssl-key", "", "Path to the SSL .key file.")
-		analysisID = flag.String("analysis-id", "", "The UUID of the analysis to use for authorization.")
+		sslCert                 = flag.String("ssl-cert", "", "Path to the SSL .crt file.")
+		sslKey                  = flag.String("ssl-key", "", "Path to the SSL .key file.")
+		analysisID              = flag.String("analysis-id", "", "The UUID of the analysis to use for authorization.")
 		encodedSSOTimeout       = flag.String("sso-timeout", "5s", "The timeout period for back-channel requests to the identity provider.")
 		encodedReadTimeout      = flag.String("read-timeout", "48h", "The maximum duration for reading the entire request, including the body.")
 		encodedWriteTimeout     = flag.String("write-timeout", "48h", "The maximum duration before timing out writes of the response.")

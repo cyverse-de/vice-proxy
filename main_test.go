@@ -16,7 +16,7 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-// getVICEProxy returns a VICEProxy instance with some default settnigs for testing. Some fields that aren't being used
+// getVICEProxy returns a VICEProxy instance with some default settings for testing. Some fields that aren't being used
 // during testing are omitted.
 func getVICEProxy() *VICEProxy {
 	// Create a session store for testing
