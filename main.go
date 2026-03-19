@@ -570,7 +570,7 @@ func (c *VICEProxy) HandleBackChannelLogout(w http.ResponseWriter, r *http.Reque
 	}
 
 	// The events claim should be a map containing the backchannel-logout event
-	eventsMap, ok := events.(map[string]interface{})
+	eventsMap, ok := events.(map[string]any)
 	if !ok {
 		log.Errorf("logout token events claim is not a map: %T", events)
 		http.Error(w, "invalid logout token: malformed events", http.StatusBadRequest)
@@ -713,7 +713,7 @@ func (c *VICEProxy) URLIsReady(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if ready {
-		_, _ = fmt.Fprint(w, string(body))
+		_, _ = w.Write(body)
 	} else {
 		http.Error(w, string(body), http.StatusNotAcceptable)
 	}
@@ -852,36 +852,37 @@ func main() {
 	logrus.SetReportCaller(true)
 	logrus.SetLevel(logrus.InfoLevel)
 
+	// Per-pod flags — injected by the vice-operator transform.
 	var (
-		corsOrigins             originFlags
-		backendURL              = flag.String("backend-url", "http://localhost:60000", "The hostname and port to proxy requests to.")
-		wsbackendURL            = flag.String("ws-backend-url", "", "The backend URL for the handling websocket requests. Defaults to the value of --backend-url with a scheme of ws://")
-		frontendURL             = flag.String("frontend-url", "", "The URL for the frontend server. Might be different from the hostname and listen port.")
-		listenAddr              = flag.String("listen-addr", "0.0.0.0:8080", "The listen port number.")
-		keycloakBaseURL         = flag.String("keycloak-base-url", "", "The base URL to use when checking Keycloak authentication.")
-		keycloakRealm           = flag.String("keycloak-realm", "", "The realm to use when checking Keycloak authentication.")
-		keycloakClientID        = flag.String("keycloak-client-id", "", "The ID of the OIDC client to use for Keycloak.")
-		keycloakClientSecret    = flag.String("keycloak-client-secret", "", "The secret of the OIDC client to use for Keycloak.")
-		maxAge                  = flag.Int("max-age", 0, "The idle timeout for session, in seconds.")
-		sslCert                 = flag.String("ssl-cert", "", "Path to the SSL .crt file.")
-		sslKey                  = flag.String("ssl-key", "", "Path to the SSL .key file.")
-		analysisID              = flag.String("analysis-id", "", "The UUID of the analysis to use for authorization.")
-		encodedSSOTimeout       = flag.String("sso-timeout", "5s", "The timeout period for back-channel requests to the identity provider.")
-		encodedReadTimeout      = flag.String("read-timeout", "48h", "The maximum duration for reading the entire request, including the body.")
-		encodedWriteTimeout     = flag.String("write-timeout", "48h", "The maximum duration before timing out writes of the response.")
-		encodedIdleTimeout      = flag.String("idle-timeout", "5000s", "The maximum amount of time to wait for the next request when keep-alives are enabled.")
-		disableAuth             = flag.Bool("disable-auth", false, "Disable authentication and authorization. When true, allows unauthenticated access to the proxied application.")
-		enableLegacyAuth        = flag.Bool("enable-legacy-auth", false, "Use per-request check-resource-access calls instead of Keycloak UMA authorization.")
-		checkResourceAccessBase = flag.String("check-resource-access-base", "http://check-resource-access", "Base URL for the check-resource-access service (legacy auth mode).")
-		encodedJWKSCacheTTL     = flag.String("jwks-cache-ttl", "1h", "How long to cache Keycloak JWKS certificates. Set to 0 to disable caching.")
+		backendURL          = flag.String("backend-url", "http://localhost:60000", "The hostname and port to proxy requests to.")
+		wsbackendURL        = flag.String("ws-backend-url", "", "The backend URL for the handling websocket requests. Defaults to the value of --backend-url with a scheme of ws://")
+		listenAddr          = flag.String("listen-addr", "0.0.0.0:8080", "The listen port number.")
+		analysisID          = flag.String("analysis-id", "", "The UUID of the analysis to use for authorization.")
+		maxAge              = flag.Int("max-age", 0, "The idle timeout for session, in seconds.")
+		sslCert             = flag.String("ssl-cert", "", "Path to the SSL .crt file.")
+		sslKey              = flag.String("ssl-key", "", "Path to the SSL .key file.")
+		encodedSSOTimeout   = flag.String("sso-timeout", "5s", "The timeout period for back-channel requests to the identity provider.")
+		encodedReadTimeout  = flag.String("read-timeout", "48h", "The maximum duration for reading the entire request, including the body.")
+		encodedWriteTimeout = flag.String("write-timeout", "48h", "The maximum duration before timing out writes of the response.")
+		encodedIdleTimeout  = flag.String("idle-timeout", "5000s", "The maximum amount of time to wait for the next request when keep-alives are enabled.")
+		encodedJWKSCacheTTL = flag.String("jwks-cache-ttl", "1h", "How long to cache Keycloak JWKS certificates. Set to 0 to disable caching.")
 	)
 
-	flag.Var(&corsOrigins, "allowed-origins", "List of allowed origins, separated by commas.")
 	flag.Parse()
 
-	// Derive frontendURL from VICE_BASE_URL env var if set. The pod hostname
-	// is the subdomain hash set by app-exposer, so combining it with the base
-	// URL produces the full analysis URL.
+	// Cluster-specific config from env vars (via cluster-config-secret).
+	keycloakBaseURL := os.Getenv("KEYCLOAK_BASE_URL")
+	keycloakRealm := os.Getenv("KEYCLOAK_REALM")
+	keycloakClientID := os.Getenv("KEYCLOAK_CLIENT_ID")
+	keycloakClientSecret := os.Getenv("KEYCLOAK_CLIENT_SECRET")
+	disableAuth := strings.EqualFold(os.Getenv("DISABLE_AUTH"), "true")
+	enableLegacyAuth := strings.EqualFold(os.Getenv("ENABLE_LEGACY_AUTH"), "true")
+	checkResourceAccessBase := os.Getenv("CHECK_RESOURCE_ACCESS_BASE")
+
+	// Derive frontendURL from VICE_BASE_URL env var. The pod hostname is the
+	// subdomain hash set by app-exposer, so combining it with the base URL
+	// produces the full analysis URL.
+	var frontendURL string
 	if baseURL := os.Getenv("VICE_BASE_URL"); baseURL != "" {
 		hostname, err := os.Hostname()
 		if err != nil {
@@ -892,12 +893,12 @@ func main() {
 			log.Fatalf("failed to parse VICE_BASE_URL %q: %v", baseURL, err)
 		}
 		parsedBase.Host = fmt.Sprintf("%s.%s", hostname, parsedBase.Host)
-		*frontendURL = parsedBase.String()
-		log.Infof("derived frontend URL from VICE_BASE_URL: %s", *frontendURL)
+		frontendURL = parsedBase.String()
+		log.Infof("derived frontend URL from VICE_BASE_URL: %s", frontendURL)
 	}
 
-	if *frontendURL == "" {
-		log.Fatal("--frontend-url must be set.")
+	if frontendURL == "" {
+		log.Fatal("VICE_BASE_URL env var must be set")
 	}
 
 	useSSL := false
@@ -912,6 +913,18 @@ func main() {
 		useSSL = true
 	}
 
+	// Derive CORS origins from VICE_BASE_URL domain.
+	var corsOrigins originFlags
+	if viceBase := os.Getenv("VICE_BASE_URL"); viceBase != "" {
+		if parsedBase, err := url.Parse(viceBase); err == nil && parsedBase.Host != "" {
+			corsOrigins = originFlags{
+				fmt.Sprintf("*.%s", parsedBase.Host),
+				parsedBase.Host,
+			}
+		} else {
+			log.Warnf("VICE_BASE_URL %q could not be parsed for CORS origins, using defaults", viceBase)
+		}
+	}
 	if len(corsOrigins) < 1 {
 		corsOrigins = originFlags{"*.cyverse.run", "*.cyverse.org", "*.cyverse.run:4343", "cyverse.run", "cyverse.run:4343"}
 	}
@@ -922,19 +935,19 @@ func main() {
 
 	log.Infof("backend URL is %s", *backendURL)
 	log.Infof("websocket backend URL is %s", *wsbackendURL)
-	log.Infof("frontend URL is %s", *frontendURL)
+	log.Infof("frontend URL is %s", frontendURL)
 	log.Infof("listen address is %s", *listenAddr)
-	log.Infof("Keycloak base URL is %s", *keycloakBaseURL)
-	log.Infof("Keycloak realm is %s", *keycloakRealm)
-	log.Infof("Keycloak client ID is %s", *keycloakClientID)
-	log.Infof("Keycloak client secret is %s", *keycloakClientSecret)
+	log.Infof("Keycloak base URL is %s", keycloakBaseURL)
+	log.Infof("Keycloak realm is %s", keycloakRealm)
+	log.Infof("Keycloak client ID is %s", keycloakClientID)
+	log.Infof("Keycloak client secret is set: %v", keycloakClientSecret != "")
 	log.Infof("read timeout is %s", *encodedReadTimeout)
 	log.Infof("write timeout is %s", *encodedWriteTimeout)
 	log.Infof("idle timeout is %s", *encodedIdleTimeout)
-	log.Infof("authentication disabled: %v", *disableAuth)
-	log.Infof("legacy auth enabled: %v", *enableLegacyAuth)
-	if *enableLegacyAuth {
-		log.Infof("check-resource-access base URL: %s", *checkResourceAccessBase)
+	log.Infof("authentication disabled: %v", disableAuth)
+	log.Infof("legacy auth enabled: %v", enableLegacyAuth)
+	if enableLegacyAuth {
+		log.Infof("check-resource-access base URL: %s", checkResourceAccessBase)
 	}
 
 	for _, c := range corsOrigins {
@@ -988,23 +1001,23 @@ func main() {
 	}
 
 	p := &VICEProxy{
-		keycloakBaseURL:         *keycloakBaseURL,
-		keycloakRealm:           *keycloakRealm,
-		keycloakClientID:        *keycloakClientID,
-		keycloakClientSecret:    *keycloakClientSecret,
-		frontendURL:             *frontendURL,
+		keycloakBaseURL:         keycloakBaseURL,
+		keycloakRealm:           keycloakRealm,
+		keycloakClientID:        keycloakClientID,
+		keycloakClientSecret:    keycloakClientSecret,
+		frontendURL:             frontendURL,
 		backendURL:              *backendURL,
 		wsbackendURL:            *wsbackendURL,
 		resourceName:            *analysisID,
 		sessionStore:            sessionStore,
 		ssoClient:               *client,
-		disableAuth:             *disableAuth,
-		enableLegacyAuth:        *enableLegacyAuth,
-		checkResourceAccessBase: *checkResourceAccessBase,
+		disableAuth:             disableAuth,
+		enableLegacyAuth:        enableLegacyAuth,
+		checkResourceAccessBase: checkResourceAccessBase,
 	}
 
 	// Set up JWKS caching if auth is enabled and TTL is positive.
-	if !*disableAuth && jwksCacheTTL > 0 {
+	if !disableAuth && jwksCacheTTL > 0 {
 		certsURL, err := p.KeycloakURL("certs")
 		if err != nil {
 			log.Fatalf("failed to build Keycloak certs URL: %s", err.Error())
@@ -1016,7 +1029,7 @@ func main() {
 
 		p.jwksAutoRefresh = ar
 		log.Infof("JWKS caching enabled with minimum refresh interval of %s", jwksCacheTTL)
-	} else if !*disableAuth {
+	} else if !disableAuth {
 		log.Info("JWKS caching disabled, certificates will be fetched on every token validation")
 	}
 
@@ -1035,8 +1048,8 @@ func main() {
 	// This must be available even if auth is disabled, as it's called by Keycloak/app-exposer
 	r.Path("/backchannel-logout").Methods("POST").HandlerFunc(p.HandleBackChannelLogout)
 
-	// Conditionally add authentication routes based on --disable-auth flag
-	if !*disableAuth {
+	// Conditionally add authentication routes based on DISABLE_AUTH env var.
+	if !disableAuth {
 		// Logout endpoint - clears session and redirects to Keycloak logout
 		r.Path("/logout").HandlerFunc(p.HandleLogout)
 		// If the query contains a code parameter, handle the OAuth authorization code
