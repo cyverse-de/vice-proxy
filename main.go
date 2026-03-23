@@ -350,8 +350,16 @@ func (c *VICEProxy) HandleAuthorizationCode(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
+	// Extract and validate the username string from the token claim.
+	usernameStr, ok := username.(string)
+	if !ok || usernameStr == "" {
+		err = fmt.Errorf("preferred_username claim has unexpected type %T or is empty", username)
+		log.Error(err)
+		http.Error(w, "invalid token: username claim is not a string", http.StatusInternalServerError)
+		return
+	}
+
 	// Check ConfigMap-based authorization: the user must be in the allowed-users list.
-	usernameStr, _ := username.(string)
 	if !c.isUserAllowed(usernameStr) {
 		log.Errorf("user %s not in allowed-users list for analysis %s", usernameStr, c.resourceName)
 		http.Error(w, "access denied", http.StatusForbidden)
@@ -364,7 +372,7 @@ func (c *VICEProxy) HandleAuthorizationCode(w http.ResponseWriter, r *http.Reque
 	if err != nil {
 		log.Warnf("failed to get session store, creating new session: %v", err)
 	}
-	s.Values[sessionKey] = username
+	s.Values[sessionKey] = usernameStr
 
 	// Extract and store the Keycloak session ID for back-channel logout support.
 	if sid, ok := token.Get("sid"); ok {
@@ -848,6 +856,27 @@ func main() {
 	keycloakClientID := os.Getenv("KEYCLOAK_CLIENT_ID")
 	keycloakClientSecret := os.Getenv("KEYCLOAK_CLIENT_SECRET")
 	disableAuth := strings.EqualFold(os.Getenv("DISABLE_AUTH"), "true")
+
+	// Validate required Keycloak env vars when auth is enabled to fail fast
+	// rather than producing confusing URL construction errors at login time.
+	if !disableAuth {
+		var missing []string
+		if keycloakBaseURL == "" {
+			missing = append(missing, "KEYCLOAK_BASE_URL")
+		}
+		if keycloakRealm == "" {
+			missing = append(missing, "KEYCLOAK_REALM")
+		}
+		if keycloakClientID == "" {
+			missing = append(missing, "KEYCLOAK_CLIENT_ID")
+		}
+		if keycloakClientSecret == "" {
+			missing = append(missing, "KEYCLOAK_CLIENT_SECRET")
+		}
+		if len(missing) > 0 {
+			log.Fatalf("auth is enabled but required env vars are missing: %s", strings.Join(missing, ", "))
+		}
+	}
 
 	// Derive frontendURL from VICE_BASE_URL env var. The pod hostname is the
 	// subdomain hash set by app-exposer, so combining it with the base URL
