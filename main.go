@@ -58,11 +58,11 @@ type VICEProxy struct {
 	wsbackendURL         string                // The websocket URL to forward requests to.
 	resourceName         string                // The UUID of the analysis.
 	sessionStore         *sessions.CookieStore // The backend session storage.
-	ssoClient            http.Client           // The HTTP client for back-channel requests to the IDP.
+	ssoClient            http.Client           // The HTTP client for token exchange and JWKS requests to the IDP.
 	disableAuth          bool                  // If true, authentication and authorization are disabled.
 	jwksAutoRefresh      *jwk.AutoRefresh      // Cached JWKS fetcher, nil if caching is disabled.
 	jwksCertsURL         string                // The resolved JWKS certs URL, set during initialization.
-	activeSessions       sync.Map              // Tracks valid Keycloak session IDs for back-channel logout.
+	activeSessions       sync.Map              // Tracks valid Keycloak session IDs; entries removed on logout.
 	allowedUsers         sync.Map              // In-memory set of usernames allowed to access this analysis.
 }
 
@@ -406,7 +406,7 @@ func (c *VICEProxy) HandleAuthorizationCode(w http.ResponseWriter, r *http.Reque
 	}
 	s.Values[sessionKey] = usernameStr
 
-	// Extract and store the Keycloak session ID for back-channel logout support.
+	// Extract and store the Keycloak session ID for session tracking.
 	// Try the standard "sid" claim first, then fall back to "session_state" which
 	// Keycloak includes in access tokens by default even when "sid" is not mapped.
 	sidStr := extractStringClaim(token, "sid")
@@ -418,7 +418,7 @@ func (c *VICEProxy) HandleAuthorizationCode(w http.ResponseWriter, r *http.Reque
 		c.activeSessions.Store(sidStr, usernameStr)
 		log.Debugf("registered active session: sid=%s user=%s", sidStr, usernameStr)
 	} else {
-		log.Warn("no sid or session_state claim in token; session will not be tracked for back-channel logout")
+		log.Warn("no sid or session_state claim in token; session will not be tracked for logout")
 	}
 
 	if err = s.Save(r, w); err != nil {
@@ -604,7 +604,7 @@ func (c *VICEProxy) Session(r *http.Request, m *mux.RouteMatch) bool {
 		return true
 	}
 
-	// Check if session was invalidated via back-channel logout
+	// Check if session was invalidated via logout
 	if sidRaw, ok := session.Values[keycloakSidKey]; ok {
 		sid, ok := sidRaw.(string)
 		if !ok || sid == "" {
@@ -612,7 +612,7 @@ func (c *VICEProxy) Session(r *http.Request, m *mux.RouteMatch) bool {
 			return true
 		}
 		if _, valid := c.activeSessions.Load(sid); !valid {
-			log.Debugf("session %s was invalidated via back-channel logout", sid)
+			log.Debugf("session %s was invalidated via logout", sid)
 			return true
 		}
 	}
@@ -746,7 +746,7 @@ func (c *VICEProxy) authenticateAndAuthorize(w http.ResponseWriter, r *http.Requ
 	}
 	log.Infof("authenticated user: %s", username)
 
-	// Check if session was invalidated via back-channel logout.
+	// Check if session was invalidated via logout.
 	// This mirrors the check in Session() (the mux.Matcher) as defense-in-depth:
 	// Session() guards the route match, but authenticateAndAuthorize guards the
 	// proxied request itself, which may arrive via a route that bypasses Session().
@@ -756,7 +756,7 @@ func (c *VICEProxy) authenticateAndAuthorize(w http.ResponseWriter, r *http.Requ
 			return "", errors.New("invalid session ID in cookie")
 		}
 		if _, valid := c.activeSessions.Load(sid); !valid {
-			log.Infof("session %s was invalidated via back-channel logout", sid)
+			log.Infof("session %s was invalidated via logout", sid)
 			return "", errors.New("session invalidated")
 		}
 	}
