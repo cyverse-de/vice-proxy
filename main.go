@@ -105,9 +105,27 @@ func (c *VICEProxy) loadAllowedUsers(path string) (int, error) {
 }
 
 // isUserAllowed checks whether a username is in the allowed-users set.
+// The allowed-users file may contain full usernames with a domain suffix
+// (e.g. "user@iplantcollaborative.org") while the Keycloak JWT preferred_username
+// is typically the bare username (e.g. "user"). This method checks both forms:
+// the exact username, and each entry with the @domain portion stripped.
 func (c *VICEProxy) isUserAllowed(username string) bool {
-	_, ok := c.allowedUsers.Load(username)
-	return ok
+	// Direct match (handles both bare-to-bare and full-to-full).
+	if _, ok := c.allowedUsers.Load(username); ok {
+		return true
+	}
+
+	// Check if any entry matches after stripping the @domain suffix.
+	found := false
+	c.allowedUsers.Range(func(key, _ any) bool {
+		entry, _ := key.(string)
+		if bare, _, hasSuffix := strings.Cut(entry, "@"); hasSuffix && bare == username {
+			found = true
+			return false // stop iteration
+		}
+		return true
+	})
+	return found
 }
 
 // watchPermissionsFile watches the permissions directory for ConfigMap volume

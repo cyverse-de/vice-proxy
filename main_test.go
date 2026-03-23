@@ -182,13 +182,21 @@ func TestAllowedUsersLoadAndCheck(t *testing.T) {
 
 	proxy := getVICEProxy()
 
-	// Store some allowed users directly.
+	// Store some allowed users with the full domain suffix.
 	proxy.allowedUsers.Store("alice@iplantcollaborative.org", true)
 	proxy.allowedUsers.Store("bob@iplantcollaborative.org", true)
 
-	assert.True(proxy.isUserAllowed("alice@iplantcollaborative.org"), "alice should be allowed")
-	assert.True(proxy.isUserAllowed("bob@iplantcollaborative.org"), "bob should be allowed")
+	// Full-form matches.
+	assert.True(proxy.isUserAllowed("alice@iplantcollaborative.org"), "full alice should be allowed")
+	assert.True(proxy.isUserAllowed("bob@iplantcollaborative.org"), "full bob should be allowed")
+
+	// Bare username matches (Keycloak preferred_username doesn't include suffix).
+	assert.True(proxy.isUserAllowed("alice"), "bare alice should match alice@iplantcollaborative.org")
+	assert.True(proxy.isUserAllowed("bob"), "bare bob should match bob@iplantcollaborative.org")
+
+	// Non-existent users.
 	assert.False(proxy.isUserAllowed("eve@iplantcollaborative.org"), "eve should not be allowed")
+	assert.False(proxy.isUserAllowed("eve"), "bare eve should not be allowed")
 }
 
 func TestLoadAllowedUsersFromFile(t *testing.T) {
