@@ -236,6 +236,20 @@ func (c *VICEProxy) ValidateKeycloakToken(encodedToken string) (jwt.Token, error
 	return jwt.Parse([]byte(encodedToken), jwt.WithKeySet(keySet))
 }
 
+// extractStringClaim returns the value of a JWT claim as a string, or ""
+// if the claim is missing, not a string, or empty.
+func extractStringClaim(token jwt.Token, claim string) string {
+	raw, ok := token.Get(claim)
+	if !ok {
+		return ""
+	}
+	s, ok := raw.(string)
+	if !ok {
+		return ""
+	}
+	return s
+}
+
 // HandleAuthorizationCode accepts an authorization code in the query string and uses it to obtain an access token.
 func (c *VICEProxy) HandleAuthorizationCode(w http.ResponseWriter, r *http.Request) {
 	log.Debug("validating an authorization code received from Keycloak")
@@ -393,13 +407,18 @@ func (c *VICEProxy) HandleAuthorizationCode(w http.ResponseWriter, r *http.Reque
 	s.Values[sessionKey] = usernameStr
 
 	// Extract and store the Keycloak session ID for back-channel logout support.
-	if sid, ok := token.Get("sid"); ok {
-		sidStr, ok := sid.(string)
-		if ok && sidStr != "" {
-			s.Values[keycloakSidKey] = sidStr
-			c.activeSessions.Store(sidStr, true)
-			log.Debugf("registered active session: %s", sidStr)
-		}
+	// Try the standard "sid" claim first, then fall back to "session_state" which
+	// Keycloak includes in access tokens by default even when "sid" is not mapped.
+	sidStr := extractStringClaim(token, "sid")
+	if sidStr == "" {
+		sidStr = extractStringClaim(token, "session_state")
+	}
+	if sidStr != "" {
+		s.Values[keycloakSidKey] = sidStr
+		c.activeSessions.Store(sidStr, usernameStr)
+		log.Debugf("registered active session: sid=%s user=%s", sidStr, usernameStr)
+	} else {
+		log.Warn("no sid or session_state claim in token; session will not be tracked for back-channel logout")
 	}
 
 	if err = s.Save(r, w); err != nil {
@@ -584,18 +603,15 @@ func (c *VICEProxy) HandleBackChannelLogout(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	// Extract the session ID (sid) from the token
-	sidRaw, ok := token.Get("sid")
-	if !ok {
-		log.Error("logout token missing sid claim")
-		http.Error(w, "invalid logout token: missing sid", http.StatusBadRequest)
-		return
+	// Extract the session ID from the token. Try "sid" first, then fall back
+	// to "session_state" to match the registration logic in HandleAuthorizationCode.
+	sid := extractStringClaim(token, "sid")
+	if sid == "" {
+		sid = extractStringClaim(token, "session_state")
 	}
-
-	sid, ok := sidRaw.(string)
-	if !ok || sid == "" {
-		log.Errorf("logout token sid claim is not a valid string: %T", sidRaw)
-		http.Error(w, "invalid logout token: invalid sid", http.StatusBadRequest)
+	if sid == "" {
+		log.Error("logout token missing sid and session_state claims")
+		http.Error(w, "invalid logout token: missing sid", http.StatusBadRequest)
 		return
 	}
 
@@ -605,6 +621,91 @@ func (c *VICEProxy) HandleBackChannelLogout(w http.ResponseWriter, r *http.Reque
 
 	// Return 200 OK per the OIDC Back-Channel Logout spec
 	w.WriteHeader(http.StatusOK)
+}
+
+// ActiveSession describes a single active user session.
+type ActiveSession struct {
+	SessionID string `json:"session_id"`
+	Username  string `json:"username"`
+}
+
+// ActiveSessionsResponse is returned by GET /active-sessions.
+type ActiveSessionsResponse struct {
+	Sessions []ActiveSession `json:"sessions"`
+}
+
+// HandleActiveSessions returns the list of currently active user sessions.
+// Called by the operator (not browser users), so it is registered without auth.
+func (c *VICEProxy) HandleActiveSessions(w http.ResponseWriter, r *http.Request) {
+	var sessions []ActiveSession
+	c.activeSessions.Range(func(key, value any) bool {
+		sid, _ := key.(string)
+		username, _ := value.(string)
+		sessions = append(sessions, ActiveSession{
+			SessionID: sid,
+			Username:  username,
+		})
+		return true
+	})
+
+	resp := ActiveSessionsResponse{Sessions: sessions}
+	body, err := json.Marshal(resp)
+	if err != nil {
+		log.Errorf("failed to marshal active sessions response: %v", err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = w.Write(body)
+}
+
+// LogoutUserRequest is the request body for POST /logout-user.
+type LogoutUserRequest struct {
+	Username string `json:"username"`
+}
+
+// LogoutUserResponse is returned by POST /logout-user.
+type LogoutUserResponse struct {
+	SessionsInvalidated int `json:"sessions_invalidated"`
+}
+
+// HandleLogoutUser invalidates all active sessions for a given username.
+// Called by the operator (not browser users), so it is registered without auth.
+func (c *VICEProxy) HandleLogoutUser(w http.ResponseWriter, r *http.Request) {
+	var req LogoutUserRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		log.Errorf("failed to decode logout-user request: %v", err)
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	if req.Username == "" {
+		http.Error(w, "username is required", http.StatusBadRequest)
+		return
+	}
+
+	// Delete all sessions for this user. sync.Map.Delete inside Range is safe
+	// per the Go documentation, matching the pattern in loadAllowedUsers.
+	var count int
+	c.activeSessions.Range(func(key, value any) bool {
+		if username, _ := value.(string); username == req.Username {
+			c.activeSessions.Delete(key)
+			log.Infof("invalidated session %s for user %s via logout-user", key, req.Username)
+			count++
+		}
+		return true
+	})
+
+	resp := LogoutUserResponse{SessionsInvalidated: count}
+	body, err := json.Marshal(resp)
+	if err != nil {
+		log.Errorf("failed to marshal logout-user response: %v", err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = w.Write(body)
 }
 
 // Session implements the mux.Matcher interface so that requests can be routed
@@ -1073,6 +1174,12 @@ func main() {
 	// Back-channel logout endpoint - receives logout notifications from Keycloak
 	// This must be available even if auth is disabled, as it's called by Keycloak/app-exposer
 	r.Path("/backchannel-logout").Methods("POST").HandlerFunc(p.HandleBackChannelLogout)
+
+	// Operator-facing session management endpoints — unauthenticated because
+	// they're called by the vice-operator over the in-cluster Service, not by
+	// end users through the browser.
+	r.Path("/active-sessions").Methods("GET").HandlerFunc(p.HandleActiveSessions)
+	r.Path("/logout-user").Methods("POST").HandlerFunc(p.HandleLogoutUser)
 
 	// Conditionally add authentication routes based on DISABLE_AUTH env var.
 	if !disableAuth {
