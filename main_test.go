@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -37,14 +38,14 @@ func getVICEProxy() *VICEProxy {
 	}
 }
 
-type KeycloakURLTest struct {
+type keycloakURLTest struct {
 	description string
 	components  []string
 	expected    string
 }
 
 func TestKeycloakURL(t *testing.T) {
-	tests := []KeycloakURLTest{
+	tests := []keycloakURLTest{
 		{
 			description: "no additional components",
 			components:  []string{},
@@ -176,52 +177,39 @@ func TestDisableAuthFlag(t *testing.T) {
 	assert.True(proxy.disableAuth, "disableAuth should be settable to true")
 }
 
-func TestCheckKeycloakAuthorizationGranted(t *testing.T) {
+func TestAllowedUsersLoadAndCheck(t *testing.T) {
 	assert := assert.New(t)
 
-	// Mock Keycloak token endpoint that grants the UMA ticket.
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		assert.Equal(http.MethodPost, r.Method)
-		assert.Equal("Bearer fake-access-token", r.Header.Get("Authorization"))
-
-		err := r.ParseForm()
-		assert.NoError(err)
-		assert.Equal("urn:ietf:params:oauth:grant-type:uma-ticket", r.FormValue("grant_type"))
-		assert.Equal("example-client", r.FormValue("audience"))
-		assert.Equal("test-analysis-uuid#access", r.FormValue("permission"))
-
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"access_token":"rpt-token"}`))
-	}))
-	defer server.Close()
-
 	proxy := getVICEProxy()
-	proxy.keycloakBaseURL = server.URL
-	proxy.resourceName = "test-analysis-uuid"
-	proxy.ssoClient = http.Client{Timeout: 5 * time.Second}
 
-	err := proxy.CheckKeycloakAuthorization("fake-access-token")
-	assert.NoError(err, "authorization should succeed when Keycloak grants the UMA ticket")
+	// Store some allowed users directly.
+	proxy.allowedUsers.Store("alice@iplantcollaborative.org", true)
+	proxy.allowedUsers.Store("bob@iplantcollaborative.org", true)
+
+	assert.True(proxy.isUserAllowed("alice@iplantcollaborative.org"), "alice should be allowed")
+	assert.True(proxy.isUserAllowed("bob@iplantcollaborative.org"), "bob should be allowed")
+	assert.False(proxy.isUserAllowed("eve@iplantcollaborative.org"), "eve should not be allowed")
 }
 
-func TestCheckKeycloakAuthorizationDenied(t *testing.T) {
+func TestLoadAllowedUsersFromFile(t *testing.T) {
 	assert := assert.New(t)
 
-	// Mock Keycloak token endpoint that denies the UMA ticket.
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusForbidden)
-		_, _ = w.Write([]byte(`{"error":"access_denied","error_description":"not_authorized"}`))
-	}))
-	defer server.Close()
+	// Create a temp file with allowed users.
+	tmpFile, err := os.CreateTemp("", "allowed-users-*")
+	assert.NoError(err)
+	defer func() { _ = os.Remove(tmpFile.Name()) }()
+
+	_, err = tmpFile.WriteString("alice@iplantcollaborative.org\nbob@iplantcollaborative.org\n")
+	assert.NoError(err)
+	_ = tmpFile.Close()
 
 	proxy := getVICEProxy()
-	proxy.keycloakBaseURL = server.URL
-	proxy.resourceName = "test-analysis-uuid"
-	proxy.ssoClient = http.Client{Timeout: 5 * time.Second}
-
-	err := proxy.CheckKeycloakAuthorization("fake-access-token")
-	assert.Error(err, "authorization should fail when Keycloak denies the UMA ticket")
-	assert.Contains(err.Error(), "denied access")
+	count, err := proxy.loadAllowedUsers(tmpFile.Name())
+	assert.NoError(err)
+	assert.Equal(2, count)
+	assert.True(proxy.isUserAllowed("alice@iplantcollaborative.org"))
+	assert.True(proxy.isUserAllowed("bob@iplantcollaborative.org"))
+	assert.False(proxy.isUserAllowed("eve@iplantcollaborative.org"))
 }
 
 // generateTestJWKS creates a JWKS JSON response containing an RSA public key.

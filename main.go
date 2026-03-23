@@ -1,7 +1,7 @@
 package main
 
 import (
-	"bytes"
+	"bufio"
 	"context"
 	"crypto/rand"
 	"encoding/json"
@@ -12,10 +12,12 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/fsnotify/fsnotify"
 	"github.com/google/uuid"
 	"github.com/gorilla/mux"
 	"github.com/gorilla/sessions"
@@ -32,109 +34,129 @@ var log = logrus.WithFields(logrus.Fields{
 	"group":   "org.cyverse",
 })
 
-const stateSessionName = "state-session"
-const stateSessionKey = "state-session-key"
-const sessionName = "proxy-session"
-const sessionKey = "proxy-session-key"
-const keycloakSidKey = "keycloak-sid"
+const (
+	stateSessionName = "state-session"
+	stateSessionKey  = "state-session-key"
+	sessionName      = "proxy-session"
+	sessionKey       = "proxy-session-key"
+	keycloakSidKey   = "keycloak-sid"
 
-// VICEProxy contains the application logic that handles authentication, session
-// validations, ticket validation, and request proxying.
+	// permissionsFilePath is the path to the ConfigMap-mounted allowed-users file.
+	permissionsFilePath = "/etc/vice-permissions/allowed-users"
+)
+
+// VICEProxy contains the application logic that handles Keycloak OIDC
+// authentication, session management, ConfigMap-based authorization, and
+// request proxying.
 type VICEProxy struct {
-	keycloakBaseURL         string                // The URL to use when checking for Keycloak authentication.
-	keycloakRealm           string                // The realm to use when checking for Keycloak authentication.
-	keycloakClientID        string                // The OIDC client ID for Keycloak.
-	keycloakClientSecret    string                // The OIDC client secret for Keycloak.
-	frontendURL             string                // The redirect URL.
-	backendURL              string                // The backend URL to forward to.
-	wsbackendURL            string                // The websocket URL to forward requests to.
-	resourceName            string                // The UUID of the analysis.
-	sessionStore            *sessions.CookieStore // The backend session storage.
-	ssoClient               http.Client           // The HTTP client for back-channel requests to the IDP.
-	disableAuth             bool                  // If true, authentication and authorization are disabled.
-	enableLegacyAuth        bool                  // If true, use per-request check-resource-access instead of Keycloak UMA.
-	checkResourceAccessBase string                // Base URL for the check-resource-access service (legacy mode).
-	jwksAutoRefresh         *jwk.AutoRefresh      // Cached JWKS fetcher, nil if caching is disabled.
-	jwksCertsURL            string                // The resolved JWKS certs URL, set during initialization.
-	activeSessions          sync.Map              // Tracks valid Keycloak session IDs for back-channel logout.
+	keycloakBaseURL      string                // The URL to use when checking for Keycloak authentication.
+	keycloakRealm        string                // The realm to use when checking for Keycloak authentication.
+	keycloakClientID     string                // The OIDC client ID for Keycloak.
+	keycloakClientSecret string                // The OIDC client secret for Keycloak.
+	frontendURL          string                // The redirect URL.
+	backendURL           string                // The backend URL to forward to.
+	wsbackendURL         string                // The websocket URL to forward requests to.
+	resourceName         string                // The UUID of the analysis.
+	sessionStore         *sessions.CookieStore // The backend session storage.
+	ssoClient            http.Client           // The HTTP client for back-channel requests to the IDP.
+	disableAuth          bool                  // If true, authentication and authorization are disabled.
+	jwksAutoRefresh      *jwk.AutoRefresh      // Cached JWKS fetcher, nil if caching is disabled.
+	jwksCertsURL         string                // The resolved JWKS certs URL, set during initialization.
+	activeSessions       sync.Map              // Tracks valid Keycloak session IDs for back-channel logout.
+	allowedUsers         sync.Map              // In-memory set of usernames allowed to access this analysis.
 }
 
-// Resource is an item that can have permissions attached to it in the
-// permissions service.
-type Resource struct {
-	ID   string `json:"id"`
-	Name string `json:"name"`
-	Type string `json:"resource_type"`
-}
-
-// Subject is an item that accesses resources contained in the permissions
-// service.
-type Subject struct {
-	ID        string `json:"id"`
-	SubjectID string `json:"subject_id"`
-	SourceID  string `json:"subject_source_id"`
-	Type      string `json:"subject_type"`
-}
-
-// Permission is an entry from the permissions service that tells what access
-// a subject has to a resource.
-type Permission struct {
-	ID       string   `json:"id"`
-	Level    string   `json:"permission_level"`
-	Resource Resource `json:"resource"`
-	Subject  Subject  `json:"subject"`
-}
-
-// PermissionList contains a list of permissions returned by the permissions
-// service.
-type PermissionList struct {
-	Permissions []Permission `json:"permissions"`
-}
-
-// IsAllowed returns true if the user has permission to access the resource
-// via the check-resource-access service. Used in legacy auth mode only.
-func (c *VICEProxy) IsAllowed(user, resource string) (bool, error) {
-	bodymap := map[string]string{
-		"subject":  user,
-		"resource": resource,
-	}
-
-	body, err := json.Marshal(bodymap)
+// loadAllowedUsers reads the allowed-users file and populates the in-memory set.
+// Returns the number of users loaded, or an error if the file cannot be read.
+func (c *VICEProxy) loadAllowedUsers(path string) (int, error) {
+	f, err := os.Open(path)
 	if err != nil {
-		return false, err
+		return 0, fmt.Errorf("opening permissions file %s: %w", path, err)
 	}
+	defer func() { _ = f.Close() }()
 
-	request, err := http.NewRequest(http.MethodPost, c.checkResourceAccessBase, bytes.NewReader(body))
-	if err != nil {
-		return false, err
-	}
-
-	resp, err := c.ssoClient.Do(request)
-	if err != nil {
-		return false, err
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	b, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return false, err
-	}
-
-	l := &PermissionList{
-		Permissions: []Permission{},
-	}
-
-	if err = json.Unmarshal(b, l); err != nil {
-		return false, err
-	}
-
-	if len(l.Permissions) > 0 {
-		if l.Permissions[0].Level != "" {
-			return true, nil
+	// Read all users from the file before touching the live map.
+	newUsers := make(map[string]bool)
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line != "" {
+			newUsers[line] = true
 		}
 	}
+	if err := scanner.Err(); err != nil {
+		return 0, fmt.Errorf("reading permissions file %s: %w", path, err)
+	}
 
-	return false, nil
+	// Swap in the new set: clear old entries, then store new ones.
+	// Note: there is a brief window between the Range+Delete and Store passes
+	// during which the map is empty. This is acceptable because the worst case
+	// is a single request getting a spurious 403 while the reload races; the
+	// file-watch goroutine is the only writer so the window is very short.
+	c.allowedUsers.Range(func(key, _ any) bool {
+		c.allowedUsers.Delete(key)
+		return true
+	})
+	for user := range newUsers {
+		c.allowedUsers.Store(user, true)
+	}
+
+	return len(newUsers), nil
+}
+
+// isUserAllowed checks whether a username is in the allowed-users set.
+func (c *VICEProxy) isUserAllowed(username string) bool {
+	_, ok := c.allowedUsers.Load(username)
+	return ok
+}
+
+// watchPermissionsFile watches the permissions directory for ConfigMap volume
+// updates (K8s performs a symlink swap) and reloads the allowed-users set.
+// Returns an error if the watcher cannot be created; the caller should treat
+// this as fatal since the proxy will never pick up permission changes.
+func (c *VICEProxy) watchPermissionsFile(path string) error {
+	dir := filepath.Dir(path)
+
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		return fmt.Errorf("creating fsnotify watcher for %s: %w", dir, err)
+	}
+
+	if err := watcher.Add(dir); err != nil {
+		_ = watcher.Close()
+		return fmt.Errorf("adding watch on %s: %w", dir, err)
+	}
+
+	log.Infof("watching %s for permission updates", dir)
+
+	go func() {
+		defer func() { _ = watcher.Close() }()
+		for {
+			select {
+			case event, ok := <-watcher.Events:
+				if !ok {
+					return
+				}
+				// K8s ConfigMap volumes update via symlink swap, which
+				// generates Create events on the ..data symlink.
+				if event.Op&(fsnotify.Create|fsnotify.Write) != 0 {
+					count, err := c.loadAllowedUsers(path)
+					if err != nil {
+						log.Errorf("failed to reload permissions: %v", err)
+					} else {
+						log.Infof("reloaded permissions: %d allowed users", count)
+					}
+				}
+			case err, ok := <-watcher.Errors:
+				if !ok {
+					return
+				}
+				log.Errorf("fsnotify error: %v", err)
+			}
+		}
+	}()
+
+	return nil
 }
 
 // KeycloakURL generates a URL for a Keycloak OpenID Connect endpoint. Optional
@@ -184,44 +206,6 @@ func (c *VICEProxy) FetchKeycloakCerts() (jwk.Set, error) {
 	}
 
 	return jwk.Parse(body)
-}
-
-// CheckKeycloakAuthorization requests a UMA RPT (Requesting Party Token) from Keycloak
-// to verify that the user has access to the analysis resource. Keycloak evaluates the
-// configured authorization policies (including the vice-access policy provider) and
-// returns a token if access is granted.
-func (c *VICEProxy) CheckKeycloakAuthorization(accessToken string) error {
-	tokenURL, err := c.KeycloakURL("token")
-	if err != nil {
-		return errors.Wrap(err, "failed to build Keycloak token URL for UMA check")
-	}
-
-	formParams := url.Values{}
-	formParams.Set("grant_type", "urn:ietf:params:oauth:grant-type:uma-ticket")
-	formParams.Set("audience", c.keycloakClientID)
-	formParams.Set("permission", c.resourceName+"#access")
-
-	req, err := http.NewRequest(http.MethodPost, tokenURL.String(), strings.NewReader(formParams.Encode()))
-	if err != nil {
-		return errors.Wrap(err, "failed to create UMA authorization request")
-	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Set("Authorization", "Bearer "+accessToken)
-
-	resp, err := c.ssoClient.Do(req)
-	if err != nil {
-		return errors.Wrap(err, "failed to send UMA authorization request to Keycloak")
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	// Drain the body so the connection can be reused.
-	_, _ = io.ReadAll(resp.Body)
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("keycloak denied access to resource %s (HTTP %d)", c.resourceName, resp.StatusCode)
-	}
-
-	return nil
 }
 
 // ValidateKeycloakToken verifies the signature of a Keycloak token and returns a parsed version of it.
@@ -357,24 +341,20 @@ func (c *VICEProxy) HandleAuthorizationCode(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	// Check authorization via Keycloak UMA unless legacy auth is enabled.
-	// In legacy mode, authorization is deferred to per-request IsAllowed() checks.
-	if !c.enableLegacyAuth {
-		if err := c.CheckKeycloakAuthorization(tokenResponse.AccessToken); err != nil {
-			log.Errorf("UMA authorization denied: %v", err)
-			http.Error(w, "access denied", http.StatusForbidden)
-			return
-		}
-	} else {
-		log.Debug("legacy auth enabled, skipping UMA authorization check at login")
-	}
-
 	// Get the username from the token.
 	username, ok := token.Get("preferred_username")
 	if !ok {
 		err = errors.New("no username found in the token from Keycloak")
 		log.Error(err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Check ConfigMap-based authorization: the user must be in the allowed-users list.
+	usernameStr, _ := username.(string)
+	if !c.isUserAllowed(usernameStr) {
+		log.Errorf("user %s not in allowed-users list for analysis %s", usernameStr, c.resourceName)
+		http.Error(w, "access denied", http.StatusForbidden)
 		return
 	}
 
@@ -533,12 +513,6 @@ func (c *VICEProxy) HandleLogout(w http.ResponseWriter, r *http.Request) {
 func (c *VICEProxy) HandleBackChannelLogout(w http.ResponseWriter, r *http.Request) {
 	log.Debug("handling back-channel logout request")
 
-	if r.Method != http.MethodPost {
-		log.Errorf("back-channel logout requires POST method, got %s", r.Method)
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
 	// Parse the logout_token from the form body
 	if err := r.ParseForm(); err != nil {
 		log.Errorf("failed to parse form in back-channel logout: %v", err)
@@ -675,18 +649,20 @@ func (c *VICEProxy) isWebsocket(r *http.Request) bool {
 	return strings.ToLower(r.Header.Get("Upgrade")) == "websocket"
 }
 
+// backendIsReady returns true when the backend responds with a 2xx or 3xx status.
+// Uses http.Get without a context because this is a health-check polling call
+// with no ambient request context; the server-level ReadTimeout bounds it.
+//
+//nolint:noctx // no request context available in health-check polling
 func (c *VICEProxy) backendIsReady(backendURL string) (bool, error) {
-	resp, err := http.Get(backendURL)
+	resp, err := http.Get(backendURL) //nolint:noctx
 	if err != nil {
 		return false, err
 	}
 	defer func() { _ = resp.Body.Close() }()
-	_, _ = io.ReadAll(resp.Body) // drain so connection can be reused
+	_, _ = io.ReadAll(resp.Body) // drain so the connection can be reused
 
-	if resp.StatusCode >= 200 && resp.StatusCode <= 399 {
-		return true, nil
-	}
-	return false, nil
+	return resp.StatusCode >= 200 && resp.StatusCode < 400, nil
 }
 
 // URLIsReady will write out a JSON-encoded response in the format
@@ -744,7 +720,8 @@ func (c *VICEProxy) GetFrontendHost() (string, error) {
 }
 
 // authenticateAndAuthorize validates the user's session and checks if they have permission
-// to access the resource. Returns the username on success, or an error on failure.
+// to access the resource via the ConfigMap-based allowed-users list.
+// Returns the username on success, or an error on failure.
 func (c *VICEProxy) authenticateAndAuthorize(w http.ResponseWriter, r *http.Request) (string, error) {
 	// Get the username from the cookie
 	session, err := c.sessionStore.Get(r, sessionName)
@@ -764,7 +741,10 @@ func (c *VICEProxy) authenticateAndAuthorize(w http.ResponseWriter, r *http.Requ
 	}
 	log.Infof("authenticated user: %s", username)
 
-	// Check if session was invalidated via back-channel logout
+	// Check if session was invalidated via back-channel logout.
+	// This mirrors the check in Session() (the mux.Matcher) as defense-in-depth:
+	// Session() guards the route match, but authenticateAndAuthorize guards the
+	// proxied request itself, which may arrive via a route that bypasses Session().
 	if sidRaw, ok := session.Values[keycloakSidKey]; ok {
 		sid, ok := sidRaw.(string)
 		if !ok || sid == "" {
@@ -776,17 +756,9 @@ func (c *VICEProxy) authenticateAndAuthorize(w http.ResponseWriter, r *http.Requ
 		}
 	}
 
-	// In legacy mode, check permissions per-request via the check-resource-access service.
-	// In default (Keycloak UMA) mode, authorization was already checked at login.
-	if c.enableLegacyAuth {
-		allowed, err := c.IsAllowed(username, c.resourceName)
-		if err != nil {
-			return "", errors.Wrap(err, "legacy permission check failed")
-		}
-		if !allowed {
-			return "", fmt.Errorf("user %s is not allowed to access %s", username, c.resourceName)
-		}
-		log.Infof("legacy auth: user %s authorized for resource %s", username, c.resourceName)
+	// Check ConfigMap-based authorization: the user must be in the allowed-users list.
+	if !c.isUserAllowed(username) {
+		return "", fmt.Errorf("user %s is not in the allowed-users list", username)
 	}
 
 	// CRITICAL: Don't reset session for WebSocket upgrades (would corrupt the upgrade handshake)
@@ -876,8 +848,6 @@ func main() {
 	keycloakClientID := os.Getenv("KEYCLOAK_CLIENT_ID")
 	keycloakClientSecret := os.Getenv("KEYCLOAK_CLIENT_SECRET")
 	disableAuth := strings.EqualFold(os.Getenv("DISABLE_AUTH"), "true")
-	enableLegacyAuth := strings.EqualFold(os.Getenv("ENABLE_LEGACY_AUTH"), "true")
-	checkResourceAccessBase := os.Getenv("CHECK_RESOURCE_ACCESS_BASE")
 
 	// Derive frontendURL from VICE_BASE_URL env var. The pod hostname is the
 	// subdomain hash set by app-exposer, so combining it with the base URL
@@ -945,13 +915,9 @@ func main() {
 	log.Infof("write timeout is %s", *encodedWriteTimeout)
 	log.Infof("idle timeout is %s", *encodedIdleTimeout)
 	log.Infof("authentication disabled: %v", disableAuth)
-	log.Infof("legacy auth enabled: %v", enableLegacyAuth)
-	if enableLegacyAuth {
-		log.Infof("check-resource-access base URL: %s", checkResourceAccessBase)
-	}
 
-	for _, c := range corsOrigins {
-		log.Infof("Origin: %s\n", c)
+	for _, origin := range corsOrigins {
+		log.Infof("CORS origin: %s", origin)
 	}
 
 	authkey := make([]byte, 64)
@@ -1001,19 +967,32 @@ func main() {
 	}
 
 	p := &VICEProxy{
-		keycloakBaseURL:         keycloakBaseURL,
-		keycloakRealm:           keycloakRealm,
-		keycloakClientID:        keycloakClientID,
-		keycloakClientSecret:    keycloakClientSecret,
-		frontendURL:             frontendURL,
-		backendURL:              *backendURL,
-		wsbackendURL:            *wsbackendURL,
-		resourceName:            *analysisID,
-		sessionStore:            sessionStore,
-		ssoClient:               *client,
-		disableAuth:             disableAuth,
-		enableLegacyAuth:        enableLegacyAuth,
-		checkResourceAccessBase: checkResourceAccessBase,
+		keycloakBaseURL:      keycloakBaseURL,
+		keycloakRealm:        keycloakRealm,
+		keycloakClientID:     keycloakClientID,
+		keycloakClientSecret: keycloakClientSecret,
+		frontendURL:          frontendURL,
+		backendURL:           *backendURL,
+		wsbackendURL:         *wsbackendURL,
+		resourceName:         *analysisID,
+		sessionStore:         sessionStore,
+		ssoClient:            *client,
+		disableAuth:          disableAuth,
+	}
+
+	// Load the initial allowed-users list from the permissions ConfigMap mount.
+	// If the file doesn't exist yet (e.g. in dev), log an error but continue —
+	// the watcher will pick it up when the volume is mounted.
+	if !disableAuth {
+		count, err := p.loadAllowedUsers(permissionsFilePath)
+		if err != nil {
+			log.Errorf("could not load initial permissions: %v", err)
+		} else {
+			log.Infof("loaded %d allowed users from %s", count, permissionsFilePath)
+		}
+		if err := p.watchPermissionsFile(permissionsFilePath); err != nil {
+			log.Fatalf("permissions file watcher failed (proxy cannot pick up permission changes): %v", err)
+		}
 	}
 
 	// Set up JWKS caching if auth is enabled and TTL is positive.
@@ -1079,5 +1058,4 @@ func main() {
 		err = server.ListenAndServe()
 	}
 	log.Fatal(err)
-
 }
