@@ -501,128 +501,6 @@ func (c *VICEProxy) ResetSessionExpiration(w http.ResponseWriter, r *http.Reques
 	return session.Save(r, w)
 }
 
-// HandleLogout clears the vice-proxy session and redirects to Keycloak logout.
-func (c *VICEProxy) HandleLogout(w http.ResponseWriter, r *http.Request) {
-	log.Debug("handling logout request")
-
-	// Clear the vice-proxy session and remove from active sessions
-	session, err := c.sessionStore.Get(r, sessionName)
-	if err != nil {
-		log.Warnf("failed to get session during logout: %v", err)
-	} else {
-		// Remove from active sessions map if sid exists
-		if sidRaw, ok := session.Values[keycloakSidKey]; ok {
-			if sid, ok := sidRaw.(string); ok {
-				c.activeSessions.Delete(sid)
-				log.Debugf("removed session %s from active sessions", sid)
-			}
-		}
-	}
-	session.Options.MaxAge = -1 // Delete the cookie
-	if err = session.Save(r, w); err != nil {
-		log.Errorf("failed to save session during logout: %v", err)
-	}
-
-	// Also clear the state session
-	stateSession, err := c.sessionStore.Get(r, stateSessionName)
-	if err != nil {
-		log.Warnf("failed to get state session during logout: %v", err)
-	}
-	stateSession.Options.MaxAge = -1
-	if err = stateSession.Save(r, w); err != nil {
-		log.Errorf("failed to save state session during logout: %v", err)
-	}
-
-	// Build the Keycloak logout URL.
-	logoutURL, err := c.KeycloakURL("logout")
-	if err != nil {
-		log.Errorf("failed to build Keycloak logout URL: %v", err)
-		http.Error(w, "logout failed", http.StatusInternalServerError)
-		return
-	}
-
-	// Set the post-logout redirect to the frontend URL
-	params := logoutURL.Query()
-	params.Set("post_logout_redirect_uri", c.frontendURL)
-	params.Set("client_id", c.keycloakClientID)
-	logoutURL.RawQuery = params.Encode()
-
-	log.Debugf("redirecting to Keycloak logout: %s", logoutURL.String())
-	http.Redirect(w, r, logoutURL.String(), http.StatusTemporaryRedirect)
-}
-
-// HandleBackChannelLogout handles back-channel logout notifications from Keycloak.
-// This endpoint receives a logout_token when a user logs out from Keycloak or any
-// connected application. The token contains the session ID (sid) which is used to
-// invalidate the local session.
-func (c *VICEProxy) HandleBackChannelLogout(w http.ResponseWriter, r *http.Request) {
-	log.Debug("handling back-channel logout request")
-
-	// Parse the logout_token from the form body
-	if err := r.ParseForm(); err != nil {
-		log.Errorf("failed to parse form in back-channel logout: %v", err)
-		http.Error(w, "invalid request", http.StatusBadRequest)
-		return
-	}
-
-	logoutToken := r.FormValue("logout_token")
-	if logoutToken == "" {
-		log.Error("no logout_token in back-channel logout request")
-		http.Error(w, "missing logout_token", http.StatusBadRequest)
-		return
-	}
-
-	// Validate the logout token signature using Keycloak's JWKS
-	token, err := c.ValidateKeycloakToken(logoutToken)
-	if err != nil {
-		log.Errorf("failed to validate logout token: %v", err)
-		http.Error(w, "invalid token", http.StatusBadRequest)
-		return
-	}
-
-	// Verify this is a logout token by checking for the events claim
-	events, ok := token.Get("events")
-	if !ok {
-		log.Error("logout token missing events claim")
-		http.Error(w, "invalid logout token: missing events", http.StatusBadRequest)
-		return
-	}
-
-	// The events claim should be a map containing the backchannel-logout event
-	eventsMap, ok := events.(map[string]any)
-	if !ok {
-		log.Errorf("logout token events claim is not a map: %T", events)
-		http.Error(w, "invalid logout token: malformed events", http.StatusBadRequest)
-		return
-	}
-
-	// Check for the back-channel logout event key
-	if _, ok := eventsMap["http://schemas.openid.net/event/backchannel-logout"]; !ok {
-		log.Error("logout token does not contain backchannel-logout event")
-		http.Error(w, "invalid logout token: not a backchannel logout", http.StatusBadRequest)
-		return
-	}
-
-	// Extract the session ID from the token. Try "sid" first, then fall back
-	// to "session_state" to match the registration logic in HandleAuthorizationCode.
-	sid := extractStringClaim(token, "sid")
-	if sid == "" {
-		sid = extractStringClaim(token, "session_state")
-	}
-	if sid == "" {
-		log.Error("logout token missing sid and session_state claims")
-		http.Error(w, "invalid logout token: missing sid", http.StatusBadRequest)
-		return
-	}
-
-	// Invalidate the session
-	c.activeSessions.Delete(sid)
-	log.Infof("invalidated session %s via back-channel logout", sid)
-
-	// Return 200 OK per the OIDC Back-Channel Logout spec
-	w.WriteHeader(http.StatusOK)
-}
-
 // ActiveSession describes a single active user session.
 type ActiveSession struct {
 	SessionID string `json:"session_id"`
@@ -1171,10 +1049,6 @@ func main() {
 	r.PathPrefix("/url-ready").HandlerFunc(p.URLIsReady)
 	r.Path("/frontend-url").Methods(http.MethodGet).HandlerFunc(p.FrontendURL)
 
-	// Back-channel logout endpoint - receives logout notifications from Keycloak
-	// This must be available even if auth is disabled, as it's called by Keycloak/app-exposer
-	r.Path("/backchannel-logout").Methods("POST").HandlerFunc(p.HandleBackChannelLogout)
-
 	// Operator-facing session management endpoints — unauthenticated because
 	// they're called by the vice-operator over the in-cluster Service, not by
 	// end users through the browser.
@@ -1183,8 +1057,6 @@ func main() {
 
 	// Conditionally add authentication routes based on DISABLE_AUTH env var.
 	if !disableAuth {
-		// Logout endpoint - clears session and redirects to Keycloak logout
-		r.Path("/logout").HandlerFunc(p.HandleLogout)
 		// If the query contains a code parameter, handle the OAuth authorization code
 		r.PathPrefix("/").Queries("code", "").Handler(http.HandlerFunc(p.HandleAuthorizationCode))
 		// If the request doesn't have a valid session, redirect to Keycloak for authentication
