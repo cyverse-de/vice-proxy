@@ -1,16 +1,23 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
+	"crypto/rsa"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/gorilla/sessions"
+	"github.com/lestrrat-go/jwx/jwk"
 	"github.com/stretchr/testify/assert"
 )
 
-// getVICEProxy returns a VICEProxy instance with some default settnigs for testing. Some fields that aren't being used
+// getVICEProxy returns a VICEProxy instance with some default settings for testing. Some fields that aren't being used
 // during testing are omitted.
 func getVICEProxy() *VICEProxy {
 	// Create a session store for testing
@@ -19,28 +26,26 @@ func getVICEProxy() *VICEProxy {
 	sessionStore := sessions.NewCookieStore(authkey)
 
 	return &VICEProxy{
-		keycloakBaseURL:         "https://keycloak.example.org",
-		keycloakRealm:           "example",
-		keycloakClientID:        "example-client",
-		keycloakClientSecret:    "example-secret",
-		frontendURL:             "https://foobarbaz.example.run",
-		backendURL:              "http://localhost:8888",
-		wsbackendURL:            "http://localhost:8888",
-		getAnalysisIDBase:       "http://get-analysis-id",
-		checkResourceAccessBase: "http://check-resource-access",
-		sessionStore:            sessionStore,
-		disableAuth:             false,
+		keycloakBaseURL:      "https://keycloak.example.org",
+		keycloakRealm:        "example",
+		keycloakClientID:     "example-client",
+		keycloakClientSecret: "example-secret",
+		frontendURL:          "https://foobarbaz.example.run",
+		backendURL:           "http://localhost:8888",
+		wsbackendURL:         "http://localhost:8888",
+		sessionStore:         sessionStore,
+		disableAuth:          false,
 	}
 }
 
-type KeycloakURLTest struct {
+type keycloakURLTest struct {
 	description string
 	components  []string
 	expected    string
 }
 
 func TestKeycloakURL(t *testing.T) {
-	tests := []KeycloakURLTest{
+	tests := []keycloakURLTest{
 		{
 			description: "no additional components",
 			components:  []string{},
@@ -170,4 +175,147 @@ func TestDisableAuthFlag(t *testing.T) {
 	// Test that disableAuth can be set to true
 	proxy.disableAuth = true
 	assert.True(proxy.disableAuth, "disableAuth should be settable to true")
+}
+
+func TestAllowedUsersLoadAndCheck(t *testing.T) {
+	assert := assert.New(t)
+
+	proxy := getVICEProxy()
+
+	// Store some allowed users with the full domain suffix.
+	proxy.allowedUsers.Store("alice@iplantcollaborative.org", true)
+	proxy.allowedUsers.Store("bob@iplantcollaborative.org", true)
+
+	// Full-form matches.
+	assert.True(proxy.isUserAllowed("alice@iplantcollaborative.org"), "full alice should be allowed")
+	assert.True(proxy.isUserAllowed("bob@iplantcollaborative.org"), "full bob should be allowed")
+
+	// Bare username matches (Keycloak preferred_username doesn't include suffix).
+	assert.True(proxy.isUserAllowed("alice"), "bare alice should match alice@iplantcollaborative.org")
+	assert.True(proxy.isUserAllowed("bob"), "bare bob should match bob@iplantcollaborative.org")
+
+	// Non-existent users.
+	assert.False(proxy.isUserAllowed("eve@iplantcollaborative.org"), "eve should not be allowed")
+	assert.False(proxy.isUserAllowed("eve"), "bare eve should not be allowed")
+}
+
+func TestLoadAllowedUsersFromFile(t *testing.T) {
+	assert := assert.New(t)
+
+	// Create a temp file with allowed users.
+	tmpFile, err := os.CreateTemp("", "allowed-users-*")
+	assert.NoError(err)
+	defer func() { _ = os.Remove(tmpFile.Name()) }()
+
+	_, err = tmpFile.WriteString("alice@iplantcollaborative.org\nbob@iplantcollaborative.org\n")
+	assert.NoError(err)
+	_ = tmpFile.Close()
+
+	proxy := getVICEProxy()
+	count, err := proxy.loadAllowedUsers(tmpFile.Name())
+	assert.NoError(err)
+	assert.Equal(2, count)
+	assert.True(proxy.isUserAllowed("alice@iplantcollaborative.org"))
+	assert.True(proxy.isUserAllowed("bob@iplantcollaborative.org"))
+	assert.False(proxy.isUserAllowed("eve@iplantcollaborative.org"))
+}
+
+// generateTestJWKS creates a JWKS JSON response containing an RSA public key.
+func generateTestJWKS(t *testing.T) []byte {
+	t.Helper()
+	privKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("failed to generate RSA key: %v", err)
+	}
+	key, err := jwk.New(&privKey.PublicKey)
+	if err != nil {
+		t.Fatalf("failed to create JWK: %v", err)
+	}
+	_ = key.Set(jwk.KeyIDKey, "test-key-id")
+	_ = key.Set(jwk.AlgorithmKey, "RS256")
+	_ = key.Set(jwk.KeyUsageKey, "sig")
+
+	set := jwk.NewSet()
+	set.Add(key)
+
+	data, err := json.Marshal(set)
+	if err != nil {
+		t.Fatalf("failed to marshal JWK set: %v", err)
+	}
+	return data
+}
+
+func TestFetchKeycloakCertsWithoutCache(t *testing.T) {
+	assert := assert.New(t)
+
+	jwksData := generateTestJWKS(t)
+
+	var fetchCount int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&fetchCount, 1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(jwksData)
+	}))
+	defer server.Close()
+
+	proxy := getVICEProxy()
+	proxy.keycloakBaseURL = server.URL
+	proxy.ssoClient = http.Client{Timeout: 5 * time.Second}
+	// jwksAutoRefresh is nil, so caching is disabled.
+
+	// Two calls should both hit the server.
+	keySet1, err := proxy.FetchKeycloakCerts()
+	assert.NoError(err)
+	assert.NotNil(keySet1)
+
+	keySet2, err := proxy.FetchKeycloakCerts()
+	assert.NoError(err)
+	assert.NotNil(keySet2)
+
+	assert.Equal(int32(2), atomic.LoadInt32(&fetchCount),
+		"without caching, each call should fetch from the server")
+}
+
+func TestFetchKeycloakCertsWithCache(t *testing.T) {
+	assert := assert.New(t)
+
+	jwksData := generateTestJWKS(t)
+
+	var fetchCount int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&fetchCount, 1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(jwksData)
+	}))
+	defer server.Close()
+
+	proxy := getVICEProxy()
+	proxy.keycloakBaseURL = server.URL
+
+	// Build the certs URL and set up the cache.
+	certsURL, err := proxy.KeycloakURL("certs")
+	assert.NoError(err)
+	proxy.jwksCertsURL = certsURL.String()
+
+	ar := jwk.NewAutoRefresh(context.Background())
+	ar.Configure(proxy.jwksCertsURL, jwk.WithMinRefreshInterval(1*time.Hour))
+	proxy.jwksAutoRefresh = ar
+
+	// First call fetches from the server.
+	keySet1, err := proxy.FetchKeycloakCerts()
+	assert.NoError(err)
+	assert.NotNil(keySet1)
+
+	// Second call should use the cache.
+	keySet2, err := proxy.FetchKeycloakCerts()
+	assert.NoError(err)
+	assert.NotNil(keySet2)
+
+	// Third call should also use the cache.
+	keySet3, err := proxy.FetchKeycloakCerts()
+	assert.NoError(err)
+	assert.NotNil(keySet3)
+
+	assert.Equal(int32(1), atomic.LoadInt32(&fetchCount),
+		"with caching, only the first call should fetch from the server")
 }
