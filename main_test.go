@@ -309,6 +309,78 @@ func TestExtractStringSliceClaim(t *testing.T) {
 	}
 }
 
+func TestComputeIsAdmin(t *testing.T) {
+	tests := []struct {
+		name              string
+		adminEntitlements []string
+		setClaim          func(tok jwt.Token) // optional; nil means leave the entitlement claim unset
+		want              bool
+	}{
+		{
+			name:              "matching entitlement",
+			adminEntitlements: []string{"core-services"},
+			setClaim:          func(tok jwt.Token) { _ = tok.Set("entitlement", []any{"core-services"}) },
+			want:              true,
+		},
+		{
+			name:              "non-matching entitlement",
+			adminEntitlements: []string{"core-services"},
+			setClaim:          func(tok jwt.Token) { _ = tok.Set("entitlement", []any{"users"}) },
+			want:              false,
+		},
+		{
+			name:              "any-matching among many",
+			adminEntitlements: []string{"core-services", "tito-admins"},
+			setClaim:          func(tok jwt.Token) { _ = tok.Set("entitlement", []any{"users", "tito-admins"}) },
+			want:              true,
+		},
+		{
+			name:              "json-decoded interface-slice shape",
+			adminEntitlements: []string{"core-services"},
+			setClaim:          func(tok jwt.Token) { _ = tok.Set("entitlement", []any{"core-services"}) },
+			want:              true,
+		},
+		{
+			name:              "string-slice shape",
+			adminEntitlements: []string{"core-services"},
+			setClaim:          func(tok jwt.Token) { _ = tok.Set("entitlement", []string{"core-services"}) },
+			want:              true,
+		},
+		{
+			name:              "missing entitlement claim",
+			adminEntitlements: []string{"core-services"},
+			setClaim:          nil,
+			want:              false,
+		},
+		{
+			name:              "empty admin allowlist",
+			adminEntitlements: nil,
+			setClaim:          func(tok jwt.Token) { _ = tok.Set("entitlement", []any{"core-services"}) },
+			want:              false,
+		},
+		{
+			name:              "both empty",
+			adminEntitlements: nil,
+			setClaim:          nil,
+			want:              false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			proxy := getVICEProxy()
+			proxy.adminEntitlements = tt.adminEntitlements
+
+			tok := jwt.New()
+			if tt.setClaim != nil {
+				tt.setClaim(tok)
+			}
+
+			assert.Equal(t, tt.want, proxy.computeIsAdmin(tok))
+		})
+	}
+}
+
 // requestWithSession returns an HTTP request whose cookies carry the given
 // proxy-session values. Done via a save/replay round-trip on the proxy's
 // CookieStore so the resulting cookie matches what the production code path
@@ -337,13 +409,13 @@ func requestWithSession(t *testing.T, proxy *VICEProxy, username string, isAdmin
 
 func TestAuthenticateAndAuthorizeAdminBypass(t *testing.T) {
 	tests := []struct {
-		name       string
-		username   string
-		isAdmin    bool
-		preStore   []string // usernames to seed into allowedUsers
-		wantOK     bool
-		wantUser   string
-		errMessage string // substring expected in error message; empty when wantOK
+		name      string
+		username  string
+		isAdmin   bool
+		preStore  []string // usernames to seed into allowedUsers
+		wantOK    bool
+		wantUser  string
+		wantErrIs error // expected sentinel for errors.Is; nil when wantOK
 	}{
 		{
 			name:     "in allowed-users, not admin → allowed",
@@ -370,12 +442,12 @@ func TestAuthenticateAndAuthorizeAdminBypass(t *testing.T) {
 			wantUser: "carol",
 		},
 		{
-			name:       "not in allowed-users and not admin → denied",
-			username:   "carol",
-			isAdmin:    false,
-			preStore:   []string{"alice@iplantcollaborative.org"},
-			wantOK:     false,
-			errMessage: "not in the allowed-users list and is not an admin",
+			name:      "not in allowed-users and not admin → denied",
+			username:  "carol",
+			isAdmin:   false,
+			preStore:  []string{"alice@iplantcollaborative.org"},
+			wantOK:    false,
+			wantErrIs: errAccessDenied,
 		},
 	}
 
@@ -396,8 +468,8 @@ func TestAuthenticateAndAuthorizeAdminBypass(t *testing.T) {
 				assert.Equal(t, tt.wantUser, gotUser)
 			} else {
 				assert.Error(t, err)
-				if tt.errMessage != "" {
-					assert.Contains(t, err.Error(), tt.errMessage)
+				if tt.wantErrIs != nil {
+					assert.ErrorIs(t, err, tt.wantErrIs)
 				}
 			}
 		})

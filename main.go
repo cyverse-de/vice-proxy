@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/json"
+	stderrors "errors"
 	"flag"
 	"fmt"
 	"io"
@@ -28,6 +29,12 @@ import (
 	"github.com/rs/cors"
 	"github.com/sirupsen/logrus"
 )
+
+// errAccessDenied is the sentinel returned by authenticateAndAuthorize when a
+// user is neither in the per-analysis allowed-users list nor flagged as an
+// admin in their session. Callers should compare with errors.Is rather than
+// matching error strings.
+var errAccessDenied = stderrors.New("access denied")
 
 var log = logrus.WithFields(logrus.Fields{
 	"service": "vice-proxy",
@@ -291,6 +298,14 @@ func parseAdminEntitlements(raw string) []string {
 	return out
 }
 
+// computeIsAdmin reports whether a token's entitlement claim grants admin
+// access — i.e., any of its values match the configured adminEntitlements
+// allowlist. Captured at OAuth-callback time and persisted in the session
+// so subsequent requests don't have to re-parse the JWT.
+func (c *VICEProxy) computeIsAdmin(token jwt.Token) bool {
+	return anyMatch(extractStringSliceClaim(token, "entitlement"), c.adminEntitlements)
+}
+
 // anyMatch reports whether any element of a is also present in b. Both
 // inputs are typically very small (≤10 entries each) so a linear scan is
 // adequate and avoids the allocation of a set.
@@ -448,8 +463,7 @@ func (c *VICEProxy) HandleAuthorizationCode(w http.ResponseWriter, r *http.Reque
 	// the per-analysis allowed-users list — they can access any running
 	// analysis. Captured at login and stored in the session so subsequent
 	// requests don't need to re-parse the JWT.
-	userEntitlements := extractStringSliceClaim(token, "entitlement")
-	isAdmin := anyMatch(userEntitlements, c.adminEntitlements)
+	isAdmin := c.computeIsAdmin(token)
 
 	// Check ConfigMap-based authorization: the user must be in the allowed-users
 	// list, or be an admin (entitlement-bearer).
@@ -827,9 +841,11 @@ func (c *VICEProxy) authenticateAndAuthorize(w http.ResponseWriter, r *http.Requ
 	isAdmin, _ := session.Values[adminFlagKey].(bool)
 
 	// Check ConfigMap-based authorization: the user must be in the allowed-users
-	// list, or be an admin (entitlement-bearer captured at login).
+	// list, or be an admin (entitlement-bearer captured at login). Wrap the
+	// sentinel so callers can detect access denial with errors.Is without
+	// string-matching the message.
 	if !c.isUserAllowed(username) && !isAdmin {
-		return "", fmt.Errorf("user %s is not in the allowed-users list and is not an admin", username)
+		return "", fmt.Errorf("user %s: %w", username, errAccessDenied)
 	}
 
 	// CRITICAL: Don't reset session for WebSocket upgrades (would corrupt the upgrade handshake)
