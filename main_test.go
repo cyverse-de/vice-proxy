@@ -14,6 +14,7 @@ import (
 
 	"github.com/gorilla/sessions"
 	"github.com/lestrrat-go/jwx/jwk"
+	"github.com/lestrrat-go/jwx/jwt"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -218,6 +219,189 @@ func TestLoadAllowedUsersFromFile(t *testing.T) {
 	assert.True(proxy.isUserAllowed("alice@iplantcollaborative.org"))
 	assert.True(proxy.isUserAllowed("bob@iplantcollaborative.org"))
 	assert.False(proxy.isUserAllowed("eve@iplantcollaborative.org"))
+}
+
+func TestParseAdminEntitlements(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want []string
+	}{
+		{"empty", "", nil},
+		{"single", "core-services", []string{"core-services"}},
+		{"multiple", "core-services,tito-admins,dev", []string{"core-services", "tito-admins", "dev"}},
+		{"whitespace around entries", "  core-services , tito-admins  ", []string{"core-services", "tito-admins"}},
+		{"empty entries dropped", "core-services,,tito-admins,", []string{"core-services", "tito-admins"}},
+		{"only commas", ",,,", nil},
+		{"only whitespace", "   ", nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, parseAdminEntitlements(tt.in))
+		})
+	}
+}
+
+func TestAnyMatch(t *testing.T) {
+	tests := []struct {
+		name string
+		a, b []string
+		want bool
+	}{
+		{"both empty", nil, nil, false},
+		{"first empty", nil, []string{"x"}, false},
+		{"second empty", []string{"x"}, nil, false},
+		{"single match", []string{"x"}, []string{"x"}, true},
+		{"no overlap", []string{"a", "b"}, []string{"c", "d"}, false},
+		{"partial overlap", []string{"a", "b", "c"}, []string{"x", "b", "y"}, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, anyMatch(tt.a, tt.b))
+		})
+	}
+}
+
+func TestExtractStringSliceClaim(t *testing.T) {
+	tests := []struct {
+		name      string
+		setClaim  func(tok jwt.Token)
+		claimName string
+		want      []string
+	}{
+		{
+			name:      "missing claim",
+			setClaim:  func(tok jwt.Token) {},
+			claimName: "entitlement",
+			want:      nil,
+		},
+		{
+			name:      "string slice value",
+			setClaim:  func(tok jwt.Token) { _ = tok.Set("entitlement", []string{"core-services", "dev"}) },
+			claimName: "entitlement",
+			want:      []string{"core-services", "dev"},
+		},
+		{
+			name:      "interface slice value (json-decoded shape)",
+			setClaim:  func(tok jwt.Token) { _ = tok.Set("entitlement", []any{"core-services", "dev"}) },
+			claimName: "entitlement",
+			want:      []string{"core-services", "dev"},
+		},
+		{
+			name:      "interface slice with non-string elements skipped",
+			setClaim:  func(tok jwt.Token) { _ = tok.Set("entitlement", []any{"a", 42, "b"}) },
+			claimName: "entitlement",
+			want:      []string{"a", "b"},
+		},
+		{
+			name:      "wrong claim type",
+			setClaim:  func(tok jwt.Token) { _ = tok.Set("entitlement", "not-a-list") },
+			claimName: "entitlement",
+			want:      nil,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tok := jwt.New()
+			tt.setClaim(tok)
+			assert.Equal(t, tt.want, extractStringSliceClaim(tok, tt.claimName))
+		})
+	}
+}
+
+// requestWithSession returns an HTTP request whose cookies carry the given
+// proxy-session values. Done via a save/replay round-trip on the proxy's
+// CookieStore so the resulting cookie matches what the production code path
+// would have written.
+func requestWithSession(t *testing.T, proxy *VICEProxy, username string, isAdmin bool) *http.Request {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	src := httptest.NewRequest("GET", "http://example.com/test", nil)
+
+	s, err := proxy.sessionStore.Get(src, sessionName)
+	if err != nil {
+		t.Fatalf("get session: %v", err)
+	}
+	s.Values[sessionKey] = username
+	s.Values[adminFlagKey] = isAdmin
+	if err := s.Save(src, rec); err != nil {
+		t.Fatalf("save session: %v", err)
+	}
+
+	dst := httptest.NewRequest("GET", "http://example.com/test", nil)
+	for _, c := range rec.Result().Cookies() {
+		dst.AddCookie(c)
+	}
+	return dst
+}
+
+func TestAuthenticateAndAuthorizeAdminBypass(t *testing.T) {
+	tests := []struct {
+		name       string
+		username   string
+		isAdmin    bool
+		preStore   []string // usernames to seed into allowedUsers
+		wantOK     bool
+		wantUser   string
+		errMessage string // substring expected in error message; empty when wantOK
+	}{
+		{
+			name:     "in allowed-users, not admin → allowed",
+			username: "alice",
+			isAdmin:  false,
+			preStore: []string{"alice@iplantcollaborative.org"},
+			wantOK:   true,
+			wantUser: "alice",
+		},
+		{
+			name:     "in allowed-users and admin → allowed",
+			username: "alice",
+			isAdmin:  true,
+			preStore: []string{"alice@iplantcollaborative.org"},
+			wantOK:   true,
+			wantUser: "alice",
+		},
+		{
+			name:     "not in allowed-users but admin → allowed (new path)",
+			username: "carol",
+			isAdmin:  true,
+			preStore: []string{"alice@iplantcollaborative.org"},
+			wantOK:   true,
+			wantUser: "carol",
+		},
+		{
+			name:       "not in allowed-users and not admin → denied",
+			username:   "carol",
+			isAdmin:    false,
+			preStore:   []string{"alice@iplantcollaborative.org"},
+			wantOK:     false,
+			errMessage: "not in the allowed-users list and is not an admin",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			proxy := getVICEProxy()
+			proxy.resourceName = "test-analysis"
+			for _, u := range tt.preStore {
+				proxy.allowedUsers.Store(u, true)
+			}
+
+			req := requestWithSession(t, proxy, tt.username, tt.isAdmin)
+			rec := httptest.NewRecorder()
+
+			gotUser, err := proxy.authenticateAndAuthorize(rec, req)
+			if tt.wantOK {
+				assert.NoError(t, err)
+				assert.Equal(t, tt.wantUser, gotUser)
+			} else {
+				assert.Error(t, err)
+				if tt.errMessage != "" {
+					assert.Contains(t, err.Error(), tt.errMessage)
+				}
+			}
+		})
+	}
 }
 
 // generateTestJWKS creates a JWKS JSON response containing an RSA public key.

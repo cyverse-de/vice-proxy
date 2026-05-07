@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -40,6 +41,7 @@ const (
 	sessionName      = "proxy-session"
 	sessionKey       = "proxy-session-key"
 	keycloakSidKey   = "keycloak-sid"
+	adminFlagKey     = "is-admin" // session value flagging entitlement-bearing admins
 
 	// permissionsFilePath is the path to the ConfigMap-mounted allowed-users file.
 	permissionsFilePath = "/etc/vice-permissions/allowed-users"
@@ -64,6 +66,7 @@ type VICEProxy struct {
 	jwksCertsURL         string                // The resolved JWKS certs URL, set during initialization.
 	activeSessions       sync.Map              // Tracks valid Keycloak session IDs; entries removed on logout.
 	allowedUsers         sync.Map              // In-memory set of usernames allowed to access this analysis.
+	adminEntitlements    []string              // Entitlement-claim values that grant admin access regardless of allowedUsers.
 }
 
 // loadAllowedUsers reads the allowed-users file and populates the in-memory set.
@@ -250,6 +253,56 @@ func extractStringClaim(token jwt.Token, claim string) string {
 	return s
 }
 
+// extractStringSliceClaim returns the value of a JWT claim that is expected
+// to be an array of strings. Returns nil if the claim is missing or the
+// underlying value is not a string-array. The Keycloak JSON decoder may
+// surface the values as []any (each element a string) or []string
+// depending on the path, so both shapes are handled.
+func extractStringSliceClaim(token jwt.Token, claim string) []string {
+	raw, ok := token.Get(claim)
+	if !ok {
+		return nil
+	}
+	switch v := raw.(type) {
+	case []string:
+		return v
+	case []any:
+		out := make([]string, 0, len(v))
+		for _, item := range v {
+			if s, ok := item.(string); ok {
+				out = append(out, s)
+			}
+		}
+		return out
+	}
+	return nil
+}
+
+// parseAdminEntitlements splits a comma-separated entitlement list, trims
+// whitespace, and drops empty entries.
+func parseAdminEntitlements(raw string) []string {
+	var out []string
+	for part := range strings.SplitSeq(raw, ",") {
+		part = strings.TrimSpace(part)
+		if part != "" {
+			out = append(out, part)
+		}
+	}
+	return out
+}
+
+// anyMatch reports whether any element of a is also present in b. Both
+// inputs are typically very small (≤10 entries each) so a linear scan is
+// adequate and avoids the allocation of a set.
+func anyMatch(a, b []string) bool {
+	for _, v := range a {
+		if slices.Contains(b, v) {
+			return true
+		}
+	}
+	return false
+}
+
 // HandleAuthorizationCode accepts an authorization code in the query string and uses it to obtain an access token.
 func (c *VICEProxy) HandleAuthorizationCode(w http.ResponseWriter, r *http.Request) {
 	log.Debug("validating an authorization code received from Keycloak")
@@ -391,9 +444,17 @@ func (c *VICEProxy) HandleAuthorizationCode(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	// Check ConfigMap-based authorization: the user must be in the allowed-users list.
-	if !c.isUserAllowed(usernameStr) {
-		log.Errorf("user %s not in allowed-users list for analysis %s", usernameStr, c.resourceName)
+	// Determine admin status from the JWT's entitlement claim. Admins bypass
+	// the per-analysis allowed-users list — they can access any running
+	// analysis. Captured at login and stored in the session so subsequent
+	// requests don't need to re-parse the JWT.
+	userEntitlements := extractStringSliceClaim(token, "entitlement")
+	isAdmin := anyMatch(userEntitlements, c.adminEntitlements)
+
+	// Check ConfigMap-based authorization: the user must be in the allowed-users
+	// list, or be an admin (entitlement-bearer).
+	if !c.isUserAllowed(usernameStr) && !isAdmin {
+		log.Errorf("user %s not in allowed-users list and not an admin for analysis %s", usernameStr, c.resourceName)
 		http.Error(w, "access denied", http.StatusForbidden)
 		return
 	}
@@ -405,6 +466,7 @@ func (c *VICEProxy) HandleAuthorizationCode(w http.ResponseWriter, r *http.Reque
 		log.Warnf("failed to get session store, creating new session: %v", err)
 	}
 	s.Values[sessionKey] = usernameStr
+	s.Values[adminFlagKey] = isAdmin
 
 	// Extract and store the Keycloak session ID for session tracking.
 	// Try the standard "sid" claim first, then fall back to "session_state" which
@@ -761,9 +823,13 @@ func (c *VICEProxy) authenticateAndAuthorize(w http.ResponseWriter, r *http.Requ
 		}
 	}
 
-	// Check ConfigMap-based authorization: the user must be in the allowed-users list.
-	if !c.isUserAllowed(username) {
-		return "", fmt.Errorf("user %s is not in the allowed-users list", username)
+	// Read admin flag captured at login. Default false (untyped/missing).
+	isAdmin, _ := session.Values[adminFlagKey].(bool)
+
+	// Check ConfigMap-based authorization: the user must be in the allowed-users
+	// list, or be an admin (entitlement-bearer captured at login).
+	if !c.isUserAllowed(username) && !isAdmin {
+		return "", fmt.Errorf("user %s is not in the allowed-users list and is not an admin", username)
 	}
 
 	// CRITICAL: Don't reset session for WebSocket upgrades (would corrupt the upgrade handshake)
@@ -853,6 +919,7 @@ func main() {
 	keycloakClientID := os.Getenv("KEYCLOAK_CLIENT_ID")
 	keycloakClientSecret := os.Getenv("KEYCLOAK_CLIENT_SECRET")
 	disableAuth := strings.EqualFold(os.Getenv("DISABLE_AUTH"), "true")
+	adminEntitlements := parseAdminEntitlements(os.Getenv("ADMIN_ENTITLEMENTS"))
 
 	// Validate required Keycloak env vars when auth is enabled to fail fast
 	// rather than producing confusing URL construction errors at login time.
@@ -941,6 +1008,7 @@ func main() {
 	log.Infof("write timeout is %s", *encodedWriteTimeout)
 	log.Infof("idle timeout is %s", *encodedIdleTimeout)
 	log.Infof("authentication disabled: %v", disableAuth)
+	log.Infof("admin entitlements: %v", adminEntitlements)
 
 	for _, origin := range corsOrigins {
 		log.Infof("CORS origin: %s", origin)
@@ -1004,6 +1072,7 @@ func main() {
 		sessionStore:         sessionStore,
 		ssoClient:            *client,
 		disableAuth:          disableAuth,
+		adminEntitlements:    adminEntitlements,
 	}
 
 	// Load the initial allowed-users list from the permissions ConfigMap mount.
