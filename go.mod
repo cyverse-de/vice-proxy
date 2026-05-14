@@ -3,7 +3,7 @@ module github.com/cyverse-de/vice-proxy
 go 1.25
 
 require (
-	github.com/cyverse-de/go-mod/viceauth v0.0.0-20260514164934-ce1628b2909f
+	github.com/cyverse-de/go-mod/viceauth v1.0.0
 	github.com/fsnotify/fsnotify v1.9.0
 	github.com/google/uuid v1.6.0
 	github.com/gorilla/mux v1.8.1
