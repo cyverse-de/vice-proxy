@@ -63,7 +63,7 @@ type VICEProxy struct {
 	keycloakRealm        string                // The realm to use when checking for Keycloak authentication.
 	keycloakClientID     string                // The OIDC client ID for Keycloak.
 	keycloakClientSecret string                // The OIDC client secret for Keycloak.
-	frontendURL          string                // The redirect URL.
+	frontendURL          string                // The app's public base URL; used to build the post-login browser redirect, not the OAuth redirect_uri (see operatorCallbackURL).
 	backendURL           string                // The backend URL to forward to.
 	wsbackendURL         string                // The websocket URL to forward requests to.
 	resourceName         string                // The UUID of the analysis.
@@ -326,10 +326,21 @@ func (c *VICEProxy) HandleAuthorizationCode(w http.ResponseWriter, r *http.Reque
 	log.Debug("validating an authorization code received from Keycloak")
 	var err error
 
+	// Surface a Keycloak-side error (e.g. the user denied consent) directly.
+	// Such a response carries no code or state, so without this check the flow
+	// would fall through to the state check and report a confusing "no state
+	// found". Only the bounded RFC 6749 error code is echoed to the browser;
+	// the full description is logged server-side.
+	if errParam := r.URL.Query().Get("error"); errParam != "" {
+		log.Errorf("Keycloak returned an error: %s: %s", errParam, r.URL.Query().Get("error_description"))
+		http.Error(w, fmt.Sprintf("authentication failed: %s", errParam), http.StatusUnauthorized)
+		return
+	}
+
 	// Validate the state query parameter to mitigate CSRF attacks. The state is
 	// an HMAC-signed blob produced by RequireKeycloakAuth and relayed back
 	// untouched by the vice-operator. Only its StateID is checked against the
-	// cookie here; the Origin field was the operator's concern.
+	// cookie here; the Origin field is the operator's concern.
 	rawState := r.URL.Query().Get("state")
 	if rawState == "" {
 		err = errors.New("no state found in query string")
