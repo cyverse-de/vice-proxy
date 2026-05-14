@@ -19,6 +19,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/cyverse-de/go-mod/viceauth"
 	"github.com/fsnotify/fsnotify"
 	"github.com/google/uuid"
 	"github.com/gorilla/mux"
@@ -62,7 +63,7 @@ type VICEProxy struct {
 	keycloakRealm        string                // The realm to use when checking for Keycloak authentication.
 	keycloakClientID     string                // The OIDC client ID for Keycloak.
 	keycloakClientSecret string                // The OIDC client secret for Keycloak.
-	frontendURL          string                // The redirect URL.
+	frontendURL          string                // The app's public base URL; used to build the post-login browser redirect, not the OAuth redirect_uri (see operatorCallbackURL).
 	backendURL           string                // The backend URL to forward to.
 	wsbackendURL         string                // The websocket URL to forward requests to.
 	resourceName         string                // The UUID of the analysis.
@@ -74,6 +75,8 @@ type VICEProxy struct {
 	activeSessions       sync.Map              // Tracks valid Keycloak session IDs; entries removed on logout.
 	allowedUsers         sync.Map              // In-memory set of usernames allowed to access this analysis.
 	adminEntitlements    []string              // Entitlement-claim values that grant admin access regardless of allowedUsers.
+	operatorCallbackURL  string                // Static redirect_uri registered in Keycloak; the vice-operator relays the auth code from here back to this app.
+	stateCodec           *viceauth.Codec       // Signs and verifies the OAuth state parameter that round-trips through the operator relay.
 }
 
 // loadAllowedUsers reads the allowed-users file and populates the in-memory set.
@@ -323,12 +326,33 @@ func (c *VICEProxy) HandleAuthorizationCode(w http.ResponseWriter, r *http.Reque
 	log.Debug("validating an authorization code received from Keycloak")
 	var err error
 
-	// Validate the state query parameter to mitigate CSRF attacks.
-	actualState := r.URL.Query().Get("state")
-	if actualState == "" {
+	// Surface a Keycloak-side error (e.g. the user denied consent) directly.
+	// Such a response carries no code or state, so without this check the flow
+	// would fall through to the state check and report a confusing "no state
+	// found". Only the bounded RFC 6749 error code is echoed to the browser;
+	// the full description is logged server-side.
+	if errParam := r.URL.Query().Get("error"); errParam != "" {
+		log.Errorf("Keycloak returned an error: %s: %s", errParam, r.URL.Query().Get("error_description"))
+		http.Error(w, fmt.Sprintf("authentication failed: %s", errParam), http.StatusUnauthorized)
+		return
+	}
+
+	// Validate the state query parameter to mitigate CSRF attacks. The state is
+	// an HMAC-signed blob produced by RequireKeycloakAuth and relayed back
+	// untouched by the vice-operator. Only its StateID is checked against the
+	// cookie here; the Origin field is the operator's concern.
+	rawState := r.URL.Query().Get("state")
+	if rawState == "" {
 		err = errors.New("no state found in query string")
 		log.Error(err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	stateClaims, err := c.stateCodec.Decode(rawState)
+	if err != nil {
+		err = errors.Wrap(err, "failed to decode the OAuth state")
+		log.Error(err)
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 	session, err := c.sessionStore.Get(r, stateSessionName)
@@ -345,7 +369,7 @@ func (c *VICEProxy) HandleAuthorizationCode(w http.ResponseWriter, r *http.Reque
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	if expectedState != actualState {
+	if expectedState != stateClaims.StateID {
 		err = errors.New("expected state ID does not equal actual state ID")
 		log.Error(err)
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -370,7 +394,10 @@ func (c *VICEProxy) HandleAuthorizationCode(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	// Build the redirect URL.
+	// Build the clean post-login redirect URL — where the browser is sent once
+	// the token is obtained. The browser is already back on this app's domain
+	// at this point, so it is derived from frontendURL plus the original path,
+	// with the OAuth round-trip parameters stripped.
 	redirectURL, err := url.Parse(c.frontendURL)
 	if err != nil {
 		err = errors.Wrap(err, "failed to parse the frontend URL")
@@ -386,11 +413,13 @@ func (c *VICEProxy) HandleAuthorizationCode(w http.ResponseWriter, r *http.Reque
 	redirectURL.RawQuery = params.Encode()
 	redirectURL.Path = r.URL.Path
 
-	// Build the form parameters.
+	// Build the form parameters. The redirect_uri here must byte-match the one
+	// sent to Keycloak's auth endpoint (the operator callback URL), not this
+	// app's URL — OAuth requires the two to be identical.
 	formParams := url.Values{}
 	formParams.Set("grant_type", "authorization_code")
 	formParams.Set("code", code)
-	formParams.Set("redirect_uri", redirectURL.String())
+	formParams.Set("redirect_uri", c.operatorCallbackURL)
 	formParams.Set("client_id", c.keycloakClientID)
 	formParams.Set("client_secret", c.keycloakClientSecret)
 
@@ -527,15 +556,29 @@ func (c *VICEProxy) RequireKeycloakAuth(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	// Build the redirect URL.
-	redirectURL, err := url.Parse(c.frontendURL)
+	// Build the origin URL: the app URL the browser should be returned to once
+	// the vice-operator relays the authorization code back. It travels (signed)
+	// in the state parameter rather than as redirect_uri, because Keycloak
+	// cannot wildcard-match per-app VICE subdomains — only the operator's fixed
+	// callback URL is registered as a valid redirect_uri.
+	originURL, err := url.Parse(c.frontendURL)
 	if err != nil {
 		err = errors.Wrapf(err, "failed to parse the frontend URL: %s", c.frontendURL)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	redirectURL.Path = r.URL.Path
-	redirectURL.RawQuery = r.URL.RawQuery
+	originURL.Path = r.URL.Path
+	originURL.RawQuery = r.URL.RawQuery
+
+	state, err := c.stateCodec.Encode(viceauth.StateClaims{
+		StateID: stateID.String(),
+		Origin:  originURL.String(),
+	})
+	if err != nil {
+		err = errors.Wrap(err, "failed to encode the OAuth state")
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 
 	// Build the login URL and set the query parameters.
 	loginURL, err := c.KeycloakURL("auth")
@@ -546,8 +589,8 @@ func (c *VICEProxy) RequireKeycloakAuth(w http.ResponseWriter, r *http.Request) 
 	}
 	params := loginURL.Query()
 	params.Set("client_id", c.keycloakClientID)
-	params.Set("state", stateID.String())
-	params.Set("redirect_uri", redirectURL.String())
+	params.Set("state", state)
+	params.Set("redirect_uri", c.operatorCallbackURL)
 	params.Set("scope", "openid")
 	params.Set("response_type", "code")
 	loginURL.RawQuery = params.Encode()
@@ -937,6 +980,12 @@ func main() {
 	disableAuth := strings.EqualFold(os.Getenv("DISABLE_AUTH"), "true")
 	adminEntitlements := parseAdminEntitlements(os.Getenv("ADMIN_ENTITLEMENTS"))
 
+	// operatorCallbackURL is the single static redirect_uri registered in
+	// Keycloak for the vice-users client; stateHMACSecret signs the OAuth state
+	// blob so the vice-operator relay can trust the embedded app URL.
+	operatorCallbackURL := os.Getenv("OPERATOR_CALLBACK_URL")
+	stateHMACSecret := os.Getenv("STATE_HMAC_SECRET")
+
 	// Validate required Keycloak env vars when auth is enabled to fail fast
 	// rather than producing confusing URL construction errors at login time.
 	if !disableAuth {
@@ -952,6 +1001,12 @@ func main() {
 		}
 		if keycloakClientSecret == "" {
 			missing = append(missing, "KEYCLOAK_CLIENT_SECRET")
+		}
+		if operatorCallbackURL == "" {
+			missing = append(missing, "OPERATOR_CALLBACK_URL")
+		}
+		if stateHMACSecret == "" {
+			missing = append(missing, "STATE_HMAC_SECRET")
 		}
 		if len(missing) > 0 {
 			log.Fatalf("auth is enabled but required env vars are missing: %s", strings.Join(missing, ", "))
@@ -1041,6 +1096,12 @@ func main() {
 		Path:     "/",
 		MaxAge:   *maxAge,
 		HttpOnly: true,
+		// The login flow returns the browser to this app via a cross-site
+		// top-level redirect (Keycloak, then the vice-operator relay), so the
+		// state cookie must survive a SameSite=Lax navigation. Secure is gated
+		// on the deployment actually serving HTTPS.
+		SameSite: http.SameSiteLaxMode,
+		Secure:   strings.HasPrefix(frontendURL, "https://"),
 	}
 
 	// Decode the timeout duration for back-channel requests to the identity provider.
@@ -1089,6 +1150,8 @@ func main() {
 		ssoClient:            *client,
 		disableAuth:          disableAuth,
 		adminEntitlements:    adminEntitlements,
+		operatorCallbackURL:  operatorCallbackURL,
+		stateCodec:           viceauth.NewCodec([]byte(stateHMACSecret)),
 	}
 
 	// Load the initial allowed-users list from the permissions ConfigMap mount.
