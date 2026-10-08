@@ -1,5 +1,5 @@
 # First stage: Build the binary
-FROM golang:1.24 AS build-root
+FROM golang:1.25 AS build-root
 
 WORKDIR /build
 
@@ -19,7 +19,7 @@ ENV GOARCH=amd64
 RUN go build -o vice-proxy -ldflags="-w -s" .
 
 ## Second stage: Minimal runtime image
-FROM alpine:3.20
+FROM gcr.io/distroless/static-debian13:nonroot
 
 # Copy CA certificates from build stage for HTTPS connections to Keycloak
 COPY --from=build-root /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
