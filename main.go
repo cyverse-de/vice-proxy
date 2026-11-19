@@ -750,8 +750,8 @@ func (c *VICEProxy) ReverseProxy() (*httputil.ReverseProxy, error) {
 	proxy := httputil.NewSingleHostReverseProxy(backend)
 
 	// Customize the director to handle WebSocket upgrade properly
-	originalDirector := proxy.Director
-	proxy.Director = func(req *http.Request) {
+	originalDirector := proxy.Director         //nolint:staticcheck // TODO: migrate to ReverseProxy.Rewrite; deferred because it changes Host/X-Forwarded-* handling.
+	proxy.Director = func(req *http.Request) { //nolint:staticcheck // see above
 		originalDirector(req)
 		// For WebSocket requests, ensure proper scheme in target URL
 		if c.isWebsocket(req) {
