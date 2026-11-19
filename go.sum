@@ -1,5 +1,5 @@
-github.com/cyverse-de/go-mod/viceauth v1.0.0 h1:k5lCiBi7Lfa4eHZfkD1Msnez5kcAgoyUELPVSSr61H4=
-github.com/cyverse-de/go-mod/viceauth v1.0.0/go.mod h1:58UZ7WOFEAA3gy4Allc9NzVviiK10c4/2fwZDuQVXVo=
+github.com/cyverse-de/go-mod/viceauth v1.0.1 h1:bxTHrL4JIhMk9qeZJ638Y1H5rZjN6vBneCJ3ZUxKFxc=
+github.com/cyverse-de/go-mod/viceauth v1.0.1/go.mod h1:YX+/te2Vdl/bdE6j5x3yMI4ii+hpH4ogt8F/zlPyi1I=
 github.com/davecgh/go-spew v1.1.0/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/decred/dcrd/dcrec/secp256k1/v4 v4.4.1 h1:5RVFMOWjMyRy8cARdy79nAmgYw3hK/4HUq48LQ6Wwqo=
 github.com/decred/dcrd/dcrec/secp256k1/v4 v4.4.1/go.mod h1:ZXNYxsqcloTdSy/rNShjYzMhyjf0LaoftYK0p+A3h40=
